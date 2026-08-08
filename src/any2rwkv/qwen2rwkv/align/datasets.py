@@ -6,12 +6,19 @@ import json
 from itertools import cycle
 
 import torch
-from datasets import load_dataset
+from datasets import IterableDataset, load_dataset
 from huggingface_hub import hf_hub_download
 from torch.utils.data import Dataset
 
 AGENTIC_SPLITS = ("interactive_agent", "search", "tool_calling")
 AGENTIC_PARQUET_REVISION = "4fb69cd40dbf36da60c73321e094e093946e60e9"
+
+
+def _jsonl_rows(path: str):
+    with open(path, encoding="utf-8") as stream:
+        for line in stream:
+            row = json.loads(line)
+            yield {"messages": row["messages"], "tools": row.get("tools")}
 
 
 class PackedSequences(Dataset):
@@ -35,19 +42,11 @@ def _stream(repo: str, split: str, seed: int):
             revision=AGENTIC_PARQUET_REVISION,
         )
         builder = "parquet"
+        dataset = load_dataset(builder, data_files=data_files, split="train", streaming=True)
     else:
-        data_files = f"hf://datasets/{repo}/data/{split}.jsonl"
-        builder = "json"
-    return iter(
-        load_dataset(
-            builder,
-            data_files=data_files,
-            split="train",
-            streaming=True,
-        )
-        .shuffle(seed=seed, buffer_size=128)
-        .repeat(None)
-    )
+        data_files = hf_hub_download(repo, f"data/{split}.jsonl", repo_type="dataset")
+        dataset = IterableDataset.from_generator(_jsonl_rows, gen_kwargs={"path": data_files})
+    return iter(dataset.shuffle(seed=seed, buffer_size=128).repeat(None))
 
 
 def _tokens(tokenizer, row) -> list[int]:
