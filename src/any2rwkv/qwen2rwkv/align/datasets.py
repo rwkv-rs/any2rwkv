@@ -31,7 +31,7 @@ def _stream(repo: str, split: str, seed: int):
             data_files=f"hf://datasets/{repo}/data/{split}.jsonl",
             split="train",
             streaming=True,
-        ).shuffle(seed=seed, buffer_size=10_000)
+        ).shuffle(seed=seed, buffer_size=1_024)
     )
 
 
