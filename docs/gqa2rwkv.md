@@ -94,8 +94,9 @@ $$
 
 前三项分别是旧状态衰减、当前 Value-Key 写入和 rank-one erase；\(\lambda\)
 控制一阶展开之后的 closure。它不是凭经验随便塞进去的门，而是专门修正
-\(M_{t-1}\) 沿当前中心化 Key 方向的过量延续。Qwen3.5-2B 第 3 层的
-calibration/development 选择得到 \(\lambda=0.25\)。
+\(M_{t-1}\) 沿当前中心化 Key 方向的过量延续。当前 initializer 继承旧实验的
+\(\lambda=0.25\) 作为固定初值；在本仓库重新完成 calibration/development
+选择前，不能把它表述为当前数据上的最优值。
 
 ## 2. 为什么正好需要两个完整的 \(256\times256\) 状态
 
@@ -177,15 +178,10 @@ u_t^{(0)}{\kappa_t^{(0)}}^\top
 $$
 
 所以任意 \(\gamma\in[0,1]\) 都给出同一个 oracle outer product。但它们投影到
-真实 `k_proj/v_proj` 后并不等价，因此应在 calibration 内按完整 mixer
-输出选择 factorization gauge。当前真实权重选择的是
-
-$$
-\gamma=1,
-\tag{16}
-$$
-
-即把 \(\rho_t\) 全部放进 Key，Value 保留 innovation 本身。
+真实 `key/value` 后并不等价，因此完整方案应在 calibration 内按 mixer output
+选择 factorization gauge。当前实现先把中心化 Key 单位化，再把
+\(\rho_t\|\tilde k_t\|\) 放进 Value write；这是一个固定且数值稳定的 gauge，
+不是已经完成候选选择后的结论。
 
 对均值状态 \(S^{(1)}\)，取
 
@@ -203,15 +199,12 @@ d=\exp\left[-e^{-1/2}\sigma(w)\right],
 \tag{18}
 $$
 
-其最小值约为 \(0.5452\)，而 \(t=1\) 请求的 decay 是 0。这里利用第二个状态
-只占最后一列的结构，在 \(e\) 方向增加一个 erase correction，恰好抵消
-`realized_decay - requested_decay`，于是 oracle recurrence 仍能精确回放
-式 \((8)\)。
-
-真实实验中，两个完整状态的 native oracle 相对文章输出的 NMSE 为
-\(3.0\times10^{-14}\)。换句话说，从式 \((8)\) 到 RWKV7 状态更新本身已经只剩
-浮点误差；主要误差来自式 \((8)\) 对 Softmax 的近似，以及 token-level 信号
-投影到固定权重的过程。
+其最小值约为 \(0.5452\)，而 \(t=1\) 请求的 decay 是 0。第二个状态只占最后一列，
+所以可以在 \(e\) 方向增加 erase correction，抵消 mean state 的
+`realized_decay - requested_decay`。这个修正不同时解决 matrix state 的各向同性
+decay floor；matrix state 仍需裁剪并把该误差计入 native diagnostic。因此，式
+\((8)\) 到无限制 DPLR oracle 可以逐项编译，但到 clamp-w native RWKV7 不是机器
+精度无损映射。
 
 ## 4. 两个状态必须先求和，再过 target 输出边界
 
@@ -306,10 +299,10 @@ $$
 \tag{24}
 $$
 
-实现不显式构造巨大的设计矩阵，而是用真实 gate、pair-sum 和 `o_proj` 定义
-\(\mathcal A\) 及其转置，再用 matrix-free conjugate gradient 求解。ridge 在
-calibration-selection 上选择，只有 adaptive development 的完整 mixer NMSE
-下降才安装。
+可选的完整实现可以不显式构造巨大设计矩阵，而用真实 gate、pair-sum 和
+`output` 定义 \(\mathcal A\) 及其转置，再以 matrix-free conjugate gradient
+求解。当前本仓库尚未移植这一步，`r_k` 初始化为零；在实现、development 选择
+和 frozen-final 复验完成前，不宣称存在这项收益。
 
 上式描述的是可选的闭式校正问题。只有当前实现真实求解并在 frozen-final split
 复验后，才可以报告对应的数值；旧 Helicopter 的 development/final 数字不能作为
@@ -342,12 +335,13 @@ final 只在方法和参数冻结后评估一次。
    之间逐 projection 选择；按真实 nonlinear/low-rank contract 拟合其余分支。
 6. 在 pair-sum 后的完整 mixer output 上求 `o_proj`，不对两路 affine states
    分别做 GroupNorm。
-7. 固定全部参数，用式 \((24)\) 的凸问题求 `r_k` 当前 token 对角修正。
+7. 将 `r_k` 初始化为零；若以后实现式 \((24)\)，必须通过 development 选择并在
+   frozen-final 上复验。
 8. 把 tensor 物化进真实 head-size-256 module，以 BF16 kernel 在独立
    development/final rows 上验收；需要进一步对齐时，只解冻当前标准 TMix，
    再进入逐层蒸馏。
 
 这条路线的要点其实很简单：先给 affine operator 足够的完整状态容量，再利用
-RWKV7 已有的 rank-one transition 和 current-token diagonal 把递推逐项实现。
-这样，剩余误差可以明确归因于 Softmax→文章递推和静态参数投影，而不会再混入
-人为的状态压缩损失。
+RWKV7 已有的 rank-one transition 表达两路递推，并明确记录 decay floor、
+Softmax→affine recurrence、静态 signal projection 和 native normalization 各自
+留下的误差，而不会再把两状态 layout 错误混入结果。
