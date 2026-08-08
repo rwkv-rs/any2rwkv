@@ -445,6 +445,38 @@ def convert_qwen3_5_2b(source: str, output: str, agentic: str, math_dataset: str
         dist.destroy_process_group()
 
 
+def continue_global_kl(source: str, output: str) -> None:
+    """Run the single permitted corrective KL epoch from the saved final model."""
+    from ..transformers.modeling_qwen2rwkv import Qwen2RWKVForCausalLM
+
+    rank, world, device = _distributed()
+    output_path = Path(output).resolve()
+    packed_path = output_path / "packed_sequences.pt"
+    if not packed_path.is_file():
+        raise FileNotFoundError(f"missing packed sequences: {packed_path}")
+    ids = torch.load(packed_path, map_location="cpu", weights_only=True)
+    source_outer, source_text = load_qwen_teacher(source, torch.bfloat16, device)
+    student = Qwen2RWKVForCausalLM.from_pretrained(
+        output_path, dtype=torch.bfloat16
+    ).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(source)
+    _global_kl(
+        source_outer,
+        source_text,
+        student,
+        ids[rank::world].contiguous(),
+        tokenizer,
+        output_path,
+        rank,
+        world,
+        device,
+        epochs=1,
+    )
+    if world > 1:
+        dist.barrier()
+        dist.destroy_process_group()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source")
@@ -452,6 +484,7 @@ def main():
     parser.add_argument("--agentic", default="nvidia/Nemotron-SFT-Agentic-v2")
     parser.add_argument("--math", dest="math_dataset", default="nvidia/Nemotron-SFT-Math-v4")
     parser.add_argument("--accept-only", action="store_true")
+    parser.add_argument("--global-kl-only", action="store_true")
     args = parser.parse_args()
     if args.accept_only:
         raise SystemExit(0 if _accept(Path(args.output)) else 1)
@@ -468,6 +501,9 @@ def main():
             *sys.argv[1:],
         ]
         raise SystemExit(subprocess.run(command, check=False).returncode)
+    if args.global_kl_only:
+        continue_global_kl(args.source, args.output)
+        return
     convert_qwen3_5_2b(args.source, args.output, args.agentic, args.math_dataset)
 
 
