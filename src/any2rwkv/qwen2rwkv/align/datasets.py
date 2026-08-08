@@ -44,7 +44,7 @@ def _stream(repo: str, split: str, seed: int):
             data_files=data_files,
             split="train",
             streaming=True,
-        ).shuffle(seed=seed, buffer_size=1_024)
+        ).shuffle(seed=seed, buffer_size=128)
     )
 
 
