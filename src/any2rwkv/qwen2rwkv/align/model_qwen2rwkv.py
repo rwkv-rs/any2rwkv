@@ -59,6 +59,7 @@ def _validate(config) -> None:
         raise ValueError("source must be the supported Qwen3.5-2B text geometry")
 
 
+@torch.no_grad()
 def build_qwen2rwkv(source_outer, source_text) -> Qwen2RWKVForCausalLM:
     _validate(source_text.config)
     source_weight = source_text.embed_tokens.weight
@@ -77,6 +78,20 @@ def build_qwen2rwkv(source_outer, source_text) -> Qwen2RWKVForCausalLM:
             source_layer.post_attention_layernorm.state_dict()
         )
         target_layer.mlp.load_state_dict(source_layer.mlp.state_dict())
+        if source_layer.layer_type == "linear_attention":
+            source_mixer = source_layer.linear_attn
+            target_mixer = target_layer.tmix
+            target_mixer.gdn_in_proj_qkv.load_state_dict(
+                source_mixer.in_proj_qkv.state_dict()
+            )
+            target_mixer.gdn_conv1d.load_state_dict(source_mixer.conv1d.state_dict())
+            target_mixer.gdn_in_proj_z.load_state_dict(source_mixer.in_proj_z.state_dict())
+            target_mixer.gdn_in_proj_b.load_state_dict(source_mixer.in_proj_b.state_dict())
+            target_mixer.gdn_in_proj_a.load_state_dict(source_mixer.in_proj_a.state_dict())
+            target_mixer.gdn_dt_bias.copy_(source_mixer.dt_bias)
+            target_mixer.gdn_A_log.copy_(source_mixer.A_log)
+            target_mixer.gdn_norm_weight.copy_(source_mixer.norm.weight)
+            target_mixer.gdn_out_proj.load_state_dict(source_mixer.out_proj.state_dict())
     target.lm_head.load_state_dict(source_outer.lm_head.state_dict())
     target.tie_weights()
     return target

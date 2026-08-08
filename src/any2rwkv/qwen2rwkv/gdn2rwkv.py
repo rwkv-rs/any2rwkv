@@ -130,6 +130,19 @@ def initialize_gdn_layer(source, target, normalized_hidden: torch.Tensor) -> dic
     """Compile one Qwen3.5 GDN activation trace into one native D128 TMix."""
     x = normalized_hidden
     batch, length, _ = x.shape
+    if hasattr(target, "gdn_in_proj_qkv"):
+        log_decay = -source.A_log.float().exp() * F.softplus(
+            source.in_proj_a(x).float() + source.dt_bias.float()
+        )
+        target.k_k.fill_(1)
+        target.k_a.zero_()
+        target.r_k.zero_()
+        target.value_residual_scale.zero_()
+        return {
+            "decay_clipped_fraction": float((log_decay < W_SCALE).float().mean()),
+            "source_compatible_frontend": 1.0,
+            "trace_tokens": float(batch * length),
+        }
     qkv = source.in_proj_qkv(x).transpose(1, 2)
     qkv = F.conv1d(
         qkv.float(),

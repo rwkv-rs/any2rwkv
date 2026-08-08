@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import math
 
 import torch
 import torch.nn.functional as F
@@ -221,6 +222,24 @@ class Qwen2RWKVTimeMix(nn.Module):
         self.output = nn.Linear(channels, channels, bias=False)
         norm_heads = 16 if self.states_per_head == 1 else 8
         self.ln_x = nn.GroupNorm(norm_heads, channels, eps=config.group_norm_epsilon)
+        if config.source_layer_types[layer_idx] == GDN:
+            conv_width = channels * 3
+            self.gdn_in_proj_qkv = nn.Linear(channels, conv_width, bias=False)
+            self.gdn_conv1d = nn.Conv1d(
+                conv_width,
+                conv_width,
+                kernel_size=config.linear_conv_kernel_dim,
+                groups=conv_width,
+                bias=False,
+                padding=config.linear_conv_kernel_dim - 1,
+            )
+            self.gdn_in_proj_z = nn.Linear(channels, channels, bias=False)
+            self.gdn_in_proj_b = nn.Linear(channels, self.kernel_heads, bias=False)
+            self.gdn_in_proj_a = nn.Linear(channels, self.kernel_heads, bias=False)
+            self.gdn_dt_bias = nn.Parameter(torch.empty(self.kernel_heads))
+            self.gdn_A_log = nn.Parameter(torch.empty(self.kernel_heads))
+            self.gdn_norm_weight = nn.Parameter(torch.ones(self.head_size))
+            self.gdn_out_proj = nn.Linear(channels, channels, bias=False)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -271,7 +290,66 @@ class Qwen2RWKVTimeMix(nn.Module):
         diag = (r * k * self.r_k).sum(-1, keepdim=True) * v
         return (raw + diag).view(n, 8, 2, 256).sum(2).reshape(n, 2048)
 
+    def _training_forward_gdn(self, x: torch.Tensor):
+        flash = _flash("training", x)
+        if x.dtype != torch.bfloat16 or x.shape[1] % 16:
+            raise RuntimeError(
+                "training requires contiguous BF16 [B,T,2048] with T divisible by 16"
+            )
+        batch, length, channels = x.shape
+        qkv = self.gdn_in_proj_qkv(x).transpose(1, 2)
+        qkv = F.conv1d(
+            qkv,
+            self.gdn_conv1d.weight,
+            padding=self.config.linear_conv_kernel_dim - 1,
+            groups=qkv.shape[1],
+        )[:, :, :length]
+        qkv = F.silu(qkv).transpose(1, 2)
+        q, k, source_v = torch.chunk(qkv, 3, dim=-1)
+        q = q.view(batch, length, self.kernel_heads, self.head_size).float()
+        k = k.view_as(q).float()
+        source_v = source_v.view_as(q)
+        q = q * torch.rsqrt(q.square().sum(-1, keepdim=True) + 1e-6)
+        k = k * torch.rsqrt(k.square().sum(-1, keepdim=True) + 1e-6)
+        beta = torch.sigmoid(self.gdn_in_proj_b(x).float())
+        source_log_decay = -self.gdn_A_log.float().exp() * F.softplus(
+            self.gdn_in_proj_a(x).float() + self.gdn_dt_bias.float()
+        )
+        w_scale = -math.exp(-0.5)
+        decay_fraction = (source_log_decay / w_scale).clamp(1e-6, 1 - 1e-6)
+        decay_logits = torch.logit(decay_fraction)[..., None].expand_as(q).to(x.dtype)
+        erase = (beta * source_log_decay.exp()).clamp(1e-6, 1 - 1e-6)
+        erase = erase[..., None].expand_as(q).to(x.dtype)
+        r = (q / self.head_size**0.5).to(x.dtype).flatten(2)
+        k = k.to(x.dtype).flatten(2)
+        v = (source_v * beta[..., None]).to(x.dtype).flatten(2)
+        k, aa, bb = flash.pretrain_tmix_kk_pre_bf16(
+            k.contiguous(),
+            self.k_k.reshape(-1).contiguous(),
+            erase.flatten(2).contiguous(),
+            self.k_a.reshape(-1).contiguous(),
+            head_size=self.head_size,
+        )
+        raw = flash.pretrain_recurrent_bf16(
+            r.contiguous(),
+            decay_logits.flatten(2).contiguous(),
+            k,
+            v.contiguous(),
+            aa,
+            bb,
+            head_size=self.head_size,
+        )
+        raw = raw.reshape(batch * length * self.kernel_heads, self.head_size).float()
+        normalized = raw * torch.rsqrt(raw.square().mean(-1, keepdim=True) + 1e-6)
+        normalized = normalized * self.gdn_norm_weight.float()
+        gate = self.gdn_in_proj_z(x).reshape_as(normalized)
+        normalized = normalized * F.silu(gate.float())
+        mixed = normalized.to(x.dtype).view(batch, length, channels)
+        return self.gdn_out_proj(mixed), source_v.flatten(2).to(x.dtype)
+
     def _training_forward(self, x: torch.Tensor, v_first: torch.Tensor | None):
+        if self.config.source_layer_types[self.layer_idx] == GDN:
+            return self._training_forward_gdn(x)
         flash = _flash("training", x)
         if x.dtype != torch.bfloat16 or x.shape[1] % 16:
             raise RuntimeError(
