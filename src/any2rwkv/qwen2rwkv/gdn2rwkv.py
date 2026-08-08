@@ -56,10 +56,15 @@ def _native_decay_inverse(log_decay: torch.Tensor) -> torch.Tensor:
     return torch.logit((retention_log / W_SCALE).clamp(1e-6, 1 - 1e-6))
 
 
-def _low_rank_target(x: torch.Tensor, y: torch.Tensor, rank: int):
+def _low_rank_target(
+    x: torch.Tensor, y: torch.Tensor, rank: int, *, nonlinear: bool
+):
     bias = y.reshape(-1, y.shape[-1]).float().mean(0)
     full = ridge(x, y - bias)
     first, second = truncated_map(full, rank)
+    if nonlinear:
+        features = torch.tanh(x.reshape(-1, x.shape[-1]).float() @ first)
+        second = ridge(features, y.reshape(-1, y.shape[-1]).float() - bias)
     return bias, first, second
 
 
@@ -130,19 +135,6 @@ def initialize_gdn_layer(source, target, normalized_hidden: torch.Tensor) -> dic
     """Compile one Qwen3.5 GDN activation trace into one native D128 TMix."""
     x = normalized_hidden
     batch, length, _ = x.shape
-    if hasattr(target, "gdn_in_proj_qkv"):
-        log_decay = -source.A_log.float().exp() * F.softplus(
-            source.in_proj_a(x).float() + source.dt_bias.float()
-        )
-        target.k_k.fill_(1)
-        target.k_a.zero_()
-        target.r_k.zero_()
-        target.value_residual_scale.zero_()
-        return {
-            "decay_clipped_fraction": float((log_decay < W_SCALE).float().mean()),
-            "source_compatible_frontend": 1.0,
-            "trace_tokens": float(batch * length),
-        }
     qkv = source.in_proj_qkv(x).transpose(1, 2)
     qkv = F.conv1d(
         qkv.float(),
@@ -152,8 +144,10 @@ def initialize_gdn_layer(source, target, normalized_hidden: torch.Tensor) -> dic
     )[:, :, :length]
     qkv = F.silu(qkv).transpose(1, 2).to(x.dtype)
     q, k, v = torch.split(qkv, (source.key_dim, source.key_dim, source.value_dim), -1)
-    q = F.normalize(q.view(batch, length, 16, 128).float(), dim=-1)
-    k = F.normalize(k.view(batch, length, 16, 128).float(), dim=-1)
+    q = q.view(batch, length, 16, 128).float()
+    k = k.view(batch, length, 16, 128).float()
+    q = q * torch.rsqrt(q.square().sum(-1, keepdim=True) + 1e-6)
+    k = k * torch.rsqrt(k.square().sum(-1, keepdim=True) + 1e-6)
     v = v.view(batch, length, 16, 128).float()
     beta = source.in_proj_b(x).sigmoid().float()
     log_decay = -source.A_log.float().exp() * F.softplus(
@@ -179,12 +173,16 @@ def initialize_gdn_layer(source, target, normalized_hidden: torch.Tensor) -> dic
     decay_target = _native_decay_inverse(log_decay[..., None].expand(-1, -1, -1, 128).flatten(2))
     a_target = torch.logit(erase)[..., None].expand(-1, -1, -1, 128).flatten(2)
     for stem, wanted, rank in (("w", decay_target, 128), ("a", a_target, 128)):
-        ratio = target.x_w if stem == "w" else target.x_a
+        ratio, _ = fit_time_mix(x, previous, wanted)
+        ratio_parameter = target.x_w if stem == "w" else target.x_a
+        ratio_parameter.copy_(ratio.view(1, 1, -1).to(ratio_parameter))
         mixed = x + (previous - x) * ratio
-        bias, first, second = _low_rank_target(mixed, wanted, rank)
-        getattr(target, f"{stem}0").copy_(bias.view(1, 1, -1).to(ratio))
-        getattr(target, f"{stem}1").copy_(first.to(ratio))
-        getattr(target, f"{stem}2").copy_(second.to(ratio))
+        bias, first, second = _low_rank_target(
+            mixed, wanted, rank, nonlinear=stem == "w"
+        )
+        getattr(target, f"{stem}0").copy_(bias.view(1, 1, -1).to(ratio_parameter))
+        getattr(target, f"{stem}1").copy_(first.to(ratio_parameter))
+        getattr(target, f"{stem}2").copy_(second.to(ratio_parameter))
 
     source_gate = F.silu(source.in_proj_z(x).float())
     fit_native_gate(target, x, previous, source_gate)

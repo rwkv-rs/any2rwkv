@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb, repeat_kv
 
-from .gdn2rwkv import _native_decay_inverse, fit_native_gate, fit_time_mix, refit_native_output
+from .gdn2rwkv import (
+    W_SCALE,
+    _low_rank_target,
+    _native_decay_inverse,
+    fit_native_gate,
+    fit_time_mix,
+    refit_native_output,
+)
+
+CLOSURE = 0.25
 
 
 def _previous(x: torch.Tensor) -> torch.Tensor:
@@ -36,17 +44,33 @@ def initialize_gqa_layer(
     probabilities = scores.masked_fill(causal, -torch.inf).softmax(-1)
     exact_attention = torch.matmul(probabilities, v.float())
     hazard = probabilities.diagonal(dim1=-2, dim2=-1)
-    positions = torch.arange(length, device=x.device)
-    lag = (positions[:, None] - positions[None, :]).clamp_min(0)
-    mean_lag = (probabilities * lag).sum(-1).mean((0, 2)).clamp_min(1)
-    concentration = probabilities.square().sum(-1).mean((0, 2)).clamp(1e-4, 1 - 1e-4)
 
-    q_target = (F.normalize(q.float(), dim=-1) / 256**0.5).transpose(1, 2)
-    k_target = F.normalize(k.float(), dim=-1).transpose(1, 2)
-    q_target = q_target[:, :, :, None].expand(-1, -1, -1, 2, -1)
-    k_target = k_target[:, :, :, None].expand_as(q_target)
-    q_target = q_target.reshape(batch, length, 4096)
-    k_target = k_target.reshape(batch, length, 4096)
+    # The first state stores the centered affine operator.  The second stores
+    # the prefix value mean in one non-RoPE DC column.  Keep the physical
+    # [query_head, state, channel] order used by Qwen2RWKVTimeMix._pair_sum().
+    scale = 256**-0.25
+    q_prime = q.float().transpose(1, 2) * scale
+    k_prime = k.float().transpose(1, 2) * scale
+    source_value = v.float().transpose(1, 2)
+    steps = torch.arange(1, length + 1, device=x.device, dtype=torch.float32)
+    rho = steps.reciprocal().view(1, length, 1, 1)
+    mean_key = k_prime.cumsum(1) * rho
+    mean_value = source_value.cumsum(1) * rho
+    previous_mean_value = torch.cat(
+        (torch.zeros_like(mean_value[:, :1]), mean_value[:, :-1]), dim=1
+    )
+    centered_key = k_prime - mean_key
+    value_innovation = source_value - previous_mean_value
+    centered_norm = centered_key.square().sum(-1, keepdim=True).sqrt()
+    centered_direction = centered_key / centered_norm.clamp_min(1e-6)
+    dc = torch.zeros(256, dtype=torch.float32, device=x.device)
+    dc[-1] = 1
+    dc = dc.view(1, 1, 1, 256).expand(batch, length, 8, -1)
+
+    q_target = torch.stack((q_prime, dc), dim=3).reshape(batch, length, 4096)
+    k_target = torch.stack((centered_direction, dc), dim=3).reshape(
+        batch, length, 4096
+    )
     previous = _previous(x)
     for name, wanted, module in (
         ("r", q_target, target.receptance),
@@ -56,27 +80,40 @@ def initialize_gqa_layer(
         getattr(target, f"x_{name}").copy_(ratio.view(1, 1, channels))
         module.weight.copy_(fitted.T.to(module.weight))
 
-    source_value = v.transpose(1, 2).reshape(batch, length, 2048)
-    ratio, fitted = fit_time_mix(x, previous, source_value)
-    target.x_v.copy_(ratio.view(1, 1, channels))
-    target.value_base.weight.copy_(fitted.T.to(target.value_base.weight))
-    target.value_expand.weight.zero_()
-    eye = torch.eye(256, dtype=target.value_expand.weight.dtype, device=x.device) * 0.5
-    for head in range(8):
-        source_slice = slice(head * 256, (head + 1) * 256)
-        for state in range(2):
-            target_slice = slice((head * 2 + state) * 256, (head * 2 + state + 1) * 256)
-            target.value_expand.weight[target_slice, source_slice].copy_(eye)
-
-    log_decay = (-1 / mean_lag).repeat_interleave(2).repeat_interleave(256)
-    target.w0.copy_(_native_decay_inverse(log_decay).view(1, 1, -1))
-    target.w1.zero_()
-    target.w2.zero_()
-    target.a0.copy_(
-        torch.logit(concentration).repeat_interleave(2).repeat_interleave(256).view(1, 1, -1)
+    matrix_write = rho * centered_norm * value_innovation
+    mean_write = rho * source_value
+    value_target = torch.stack((matrix_write, mean_write), dim=3).reshape(
+        batch, length, 4096
     )
-    target.a1.zero_()
-    target.a2.zero_()
+    ratio, fitted = fit_time_mix(x, previous, value_target)
+    target.x_v.copy_(ratio.view(1, 1, channels))
+    target.value_base.weight.copy_(
+        torch.eye(channels, dtype=target.value_base.weight.dtype, device=x.device)
+    )
+    target.value_expand.weight.copy_(fitted.T.to(target.value_expand.weight))
+
+    requested_decay = (1 - rho).expand(batch, length, 8, 256)
+    log_decay = requested_decay.clamp_min(1e-6).log()
+    realized_log_decay = log_decay.clamp_min(W_SCALE + 1e-6)
+    realized_decay = realized_log_decay.exp()
+    matrix_erase = CLOSURE * rho * centered_norm.square()
+    mean_erase = (realized_decay - requested_decay).clamp_min(1e-6)
+    erase = torch.stack((matrix_erase.expand_as(requested_decay), mean_erase), dim=3)
+    decay_target = _native_decay_inverse(
+        torch.stack((log_decay, log_decay), dim=3).reshape(batch, length, 4096)
+    )
+    erase_target = torch.logit(erase.clamp(1e-6, 1 - 1e-6).reshape(batch, length, 4096))
+    for stem, wanted in (("w", decay_target), ("a", erase_target)):
+        ratio, _ = fit_time_mix(x, previous, wanted)
+        ratio_parameter = getattr(target, f"x_{stem}")
+        ratio_parameter.copy_(ratio.view(1, 1, -1).to(ratio_parameter))
+        mixed = x + (previous - x) * ratio
+        bias, first, second = _low_rank_target(
+            mixed, wanted, 128, nonlinear=stem == "w"
+        )
+        getattr(target, f"{stem}0").copy_(bias.view(1, 1, -1).to(ratio_parameter))
+        getattr(target, f"{stem}1").copy_(first.to(ratio_parameter))
+        getattr(target, f"{stem}2").copy_(second.to(ratio_parameter))
 
     source_gate = torch.sigmoid(source_gate.reshape(batch, length, channels).float())
     fit_native_gate(target, x, previous, source_gate)
@@ -90,9 +127,13 @@ def initialize_gqa_layer(
     source_output = source.o_proj(source_pre_output * source_gate).float()
     native_output_fit_nmse = refit_native_output(target, x, source_output)
     return {
-        "mean_attention_lag": float(mean_lag.mean()),
-        "mean_attention_concentration": float(concentration.mean()),
         "mean_exact_hazard": float(hazard.mean()),
+        "matrix_state_key_rms": float(centered_key.square().mean().sqrt()),
+        "matrix_state_write_rms": float(matrix_write.square().mean().sqrt()),
+        "mean_state_write_rms": float(mean_write.square().mean().sqrt()),
+        "requested_decay_below_native_floor_fraction": float(
+            (log_decay < W_SCALE).float().mean()
+        ),
         "native_output_fit_nmse": native_output_fit_nmse,
         "trace_tokens": float(batch * length),
     }
