@@ -4,7 +4,13 @@ version = "0.1.0"
 description = "Research tools for converting attention-based architectures to RWKV"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "FlashRWKV2 @ git+https://github.com/rwkv-rs/FlashRWKV2.git@6076320748c0266116d8030a0a4e6e25bbb15f49",
+    "datasets>=4.0",
+    "safetensors>=0.5",
+    "torch==2.13.0",
+    "transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@fe9df14d52d96ead6a5c9e03e49d3076d3ece01a",
+]
 
 [dependency-groups]
 dev = [
@@ -15,6 +21,9 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 addopts = "-ra"

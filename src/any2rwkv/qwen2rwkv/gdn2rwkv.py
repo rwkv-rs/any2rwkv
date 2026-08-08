@@ -1,0 +1,151 @@
+"""The single Gated-Delta-Net to RWKV-7 initializer used by Any2RWKV."""
+
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+
+RIDGE_SCALE = 1e-4
+
+
+def ridge(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Return the bias-free ridge map ``x @ W ~= y`` with the fixed recipe lambda."""
+    x = x.reshape(-1, x.shape[-1]).float()
+    y = y.reshape(-1, y.shape[-1]).float()
+    gram = x.T @ x
+    lam = RIDGE_SCALE * gram.trace() / x.shape[-1]
+    return torch.linalg.solve(gram + lam * torch.eye(gram.shape[0], device=x.device), x.T @ y)
+
+
+def truncated_map(full: torch.Tensor, rank: int) -> tuple[torch.Tensor, torch.Tensor]:
+    u, s, vh = torch.linalg.svd(full.float(), full_matrices=False)
+    root = s[:rank].sqrt()
+    return u[:, :rank] * root, root[:, None] * vh[:rank]
+
+
+def fit_time_mix(
+    current: torch.Tensor,
+    previous: torch.Tensor,
+    target: torch.Tensor,
+    rounds: int = 3,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Three fixed diagonal-ALS rounds for RWKV's channelwise token shift."""
+    current = current.reshape(-1, current.shape[-1]).float()
+    previous = previous.reshape_as(current).float()
+    target = target.reshape(-1, target.shape[-1]).float()
+    delta = previous - current
+    ratio = current.new_full((current.shape[-1],), 0.5)
+    projection = None
+    for _ in range(rounds):
+        mixed = current + delta * ratio
+        projection = ridge(mixed, target)
+        error = mixed @ projection - target
+        gradient = (delta * (error @ projection.T)).sum(0)
+        diagonal = delta.square().sum(0) * projection.square().sum(1) + 1e-12
+        ratio = (ratio - gradient / diagonal).clamp_(0, 1)
+    return ratio, projection
+
+
+def _previous(x: torch.Tensor) -> torch.Tensor:
+    return torch.cat((torch.zeros_like(x[:, :1]), x[:, :-1]), dim=1)
+
+
+def _native_decay_inverse(log_decay: torch.Tensor) -> torch.Tensor:
+    reachable = log_decay.clamp(max=-0.500001)
+    return -torch.log(torch.expm1(-reachable - 0.5))
+
+
+def _low_rank_target(x: torch.Tensor, y: torch.Tensor, rank: int):
+    bias = y.reshape(-1, y.shape[-1]).float().mean(0)
+    full = ridge(x, y - bias)
+    first, second = truncated_map(full, rank)
+    return bias, first, second
+
+
+def _rwkv_trace(r, k, v, erase, log_decay):
+    batch, length, heads, dim = r.shape
+    state = r.new_zeros(batch, heads, dim, dim, dtype=torch.float32)
+    outputs = []
+    for token in range(length):
+        kt = k[:, token].float()
+        state = state * log_decay[:, token].float().exp()[..., None]
+        memory = torch.einsum("bhij,bhj->bhi", state, kt)
+        state = state - erase[:, token].float()[..., None] * torch.einsum(
+            "bhi,bhj->bhij", memory, kt
+        )
+        state = state + torch.einsum("bhi,bhj->bhij", v[:, token].float(), kt)
+        outputs.append(torch.einsum("bhi,bhij->bhj", r[:, token].float(), state))
+    return torch.stack(outputs, 1)
+
+
+@torch.no_grad()
+def initialize_gdn_layer(source, target, normalized_hidden: torch.Tensor) -> dict[str, float]:
+    """Compile one Qwen3.5 GDN activation trace into one native D128 TMix."""
+    x = normalized_hidden
+    batch, length, _ = x.shape
+    qkv = source.in_proj_qkv(x).transpose(1, 2)
+    qkv = F.conv1d(
+        qkv.float(),
+        source.conv1d.weight.float(),
+        padding=source.conv_kernel_size - 1,
+        groups=source.conv_dim,
+    )[:, :, :length]
+    qkv = F.silu(qkv).transpose(1, 2).to(x.dtype)
+    q, k, v = torch.split(qkv, (source.key_dim, source.key_dim, source.value_dim), -1)
+    q = F.normalize(q.view(batch, length, 16, 128).float(), dim=-1)
+    k = F.normalize(k.view(batch, length, 16, 128).float(), dim=-1)
+    v = v.view(batch, length, 16, 128).float()
+    beta = source.in_proj_b(x).sigmoid().float()
+    log_decay = -source.A_log.float().exp() * F.softplus(
+        source.in_proj_a(x).float() + source.dt_bias.float()
+    )
+    erase = (beta * log_decay.exp()).clamp(1e-6, 1 - 1e-6)
+    write = beta[..., None] * v
+    read = q / 128**0.5
+    previous = _previous(x)
+
+    for name, wanted in (("r", read.flatten(2)), ("k", k.flatten(2)), ("v", write.flatten(2))):
+        ratio, fitted = fit_time_mix(x, previous, wanted)
+        getattr(target, f"x_{name}").copy_(ratio.view(1, 1, -1))
+        module = {"r": target.receptance, "k": target.key, "v": target.value_base}[name]
+        module.weight.copy_(fitted.T.to(module.weight))
+    target.value_expand.weight.copy_(
+        torch.eye(2048, device=x.device, dtype=target.value_expand.weight.dtype)
+    )
+
+    decay_target = _native_decay_inverse(log_decay[..., None].expand(-1, -1, -1, 128).flatten(2))
+    a_target = torch.logit(erase)[..., None].expand(-1, -1, -1, 128).flatten(2)
+    for stem, wanted, rank in (("w", decay_target, 128), ("a", a_target, 128)):
+        ratio = target.x_w if stem == "w" else target.x_a
+        mixed = x + (previous - x) * ratio
+        bias, first, second = _low_rank_target(mixed, wanted, rank)
+        getattr(target, f"{stem}0").copy_(bias.view(1, 1, -1).to(ratio))
+        getattr(target, f"{stem}1").copy_(first.to(ratio))
+        getattr(target, f"{stem}2").copy_(second.to(ratio))
+
+    source_gate = F.silu(source.in_proj_z(x).float())
+    _, first, second = _low_rank_target(x, source_gate, target.config.gate_low_rank_dim)
+    target.g1.copy_(first.to(target.g1))
+    target.g2.copy_(second.to(target.g2))
+
+    raw = _rwkv_trace(read, k, write, erase, log_decay)
+    normed = F.group_norm(
+        raw.flatten(2).transpose(1, 2),
+        16,
+        source.norm.weight.float().repeat(16),
+        None,
+        source.layer_norm_epsilon,
+    ).transpose(1, 2)
+    pre_output = normed * source_gate
+    source_output = source(x).float()
+    target.output.weight.copy_(ridge(pre_output, source_output).T.to(target.output.weight))
+    target.ln_x.weight.copy_(source.norm.weight.repeat(16).to(target.ln_x.weight))
+    target.ln_x.bias.zero_()
+    target.value_residual_scale.zero_()
+    return {
+        "decay_clipped_fraction": float((log_decay > -0.500001).float().mean()),
+        "trace_tokens": float(batch * length),
+    }
+
+
+__all__ = ["initialize_gdn_layer", "ridge", "truncated_map"]
