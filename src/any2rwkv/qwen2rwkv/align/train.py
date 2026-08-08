@@ -277,8 +277,12 @@ def _layerwise(source_text, student, ids, output, rank, world, device, through_l
         if world > 1:
             wrapper = DistributedDataParallel(wrapper, device_ids=[device.index])
         lr = 1e-5 if student.config.source_layer_types[index] == "linear_attention" else 3e-5
+        model_parameters = [p for p in wrapper.parameters() if p.requires_grad]
+        master_parameters = [
+            nn.Parameter(parameter.detach().float().clone()) for parameter in model_parameters
+        ]
         optimizer = torch.optim.AdamW(
-            [p for p in wrapper.parameters() if p.requires_grad],
+            master_parameters,
             lr=lr,
             betas=(0.9, 0.99),
             weight_decay=0.1,
@@ -311,19 +315,38 @@ def _layerwise(source_text, student, ids, output, rank, world, device, through_l
                 hidden = hidden.to(device)
                 with torch.no_grad():
                     wanted = _teacher_layer(source_text, index, hidden)
+                    wanted_mixer = _teacher_mixer(source_text, index, hidden)
                 actual = wrapper(hidden)
-                loss = (actual.float() - wanted.float()).square().mean() / (
+                actual_mixer = _student_mixer(student, index, hidden)
+                block_loss = (actual.float() - wanted.float()).square().mean() / (
                     wanted.float().square().mean() + 1e-6
                 )
+                mixer_loss = (actual_mixer.float() - wanted_mixer.float()).square().mean() / (
+                    wanted_mixer.float().square().mean() + 1e-6
+                )
+                loss = block_loss + mixer_loss
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"non-finite layer {index} loss")
                 optimizer.zero_grad(set_to_none=True)
+                for parameter in model_parameters:
+                    parameter.grad = None
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(wrapper.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model_parameters, 1.0)
+                for parameter, master in zip(
+                    model_parameters, master_parameters, strict=True
+                ):
+                    master.grad = (
+                        None if parameter.grad is None else parameter.grad.detach().float()
+                    )
                 optimizer.step()
+                with torch.no_grad():
+                    for parameter, master in zip(
+                        model_parameters, master_parameters, strict=True
+                    ):
+                        parameter.copy_(master.to(parameter.dtype))
                 scheduler.step()
                 tmix.value_residual_scale.data.zero_()
-                total += loss.detach() / len(loader)
+                total += block_loss.detach() / len(loader)
             average = _mean(total, world)
             last_train_nmse = average
             development_metrics = _evaluate_layer(
