@@ -341,12 +341,13 @@ def _accept(output: Path) -> bool:
     records = []
     passed = True
     for prompt in PROMPTS:
-        token_ids = tokenizer.apply_chat_template(
+        encoded = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
             tokenize=True,
             add_generation_prompt=True,
             return_tensors="pt",
-        ).cuda()
+        )
+        token_ids = encoded["input_ids"].cuda()
         with torch.no_grad():
             generated = model.generate(
                 token_ids, use_cache=True, do_sample=False, max_new_tokens=128
