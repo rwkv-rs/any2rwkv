@@ -105,6 +105,7 @@ def refit_native_output(
     target,
     normalized_hidden: torch.Tensor,
     source_output: torch.Tensor,
+    prior_weight: torch.Tensor | None = None,
 ) -> float:
     """Fit output projection from the real FlashRWKV2 pre-output activation."""
     captured: list[torch.Tensor] = []
@@ -120,9 +121,13 @@ def refit_native_output(
         hook.remove()
     if len(captured) != 1:
         raise RuntimeError(f"expected one native output activation, got {len(captured)}")
-    target.output.weight.copy_(
-        ridge(captured[0], source_output.float()).T.to(target.output.weight)
-    )
+    if prior_weight is None:
+        fitted = ridge(captured[0], source_output.float()).T
+    else:
+        prior = prior_weight.float()
+        residual = source_output.float() - captured[0].float() @ prior.T
+        fitted = prior + ridge(captured[0], residual).T
+    target.output.weight.copy_(fitted.to(target.output.weight))
     fitted = target.output(captured[0]).float()
     return float(
         (fitted - source_output.float()).square().mean()
@@ -205,7 +210,9 @@ def initialize_gdn_layer(source, target, normalized_hidden: torch.Tensor) -> dic
         (analytic_output - source_output).square().mean()
         / (source_output.square().mean() + 1e-12)
     )
-    native_output_fit_nmse = refit_native_output(target, x, source_output)
+    native_output_fit_nmse = refit_native_output(
+        target, x, source_output, source.out_proj.weight
+    )
     return {
         "decay_clipped_fraction": float((log_decay < W_SCALE).float().mean()),
         "analytic_pre_output_nmse": analytic_output_nmse,
