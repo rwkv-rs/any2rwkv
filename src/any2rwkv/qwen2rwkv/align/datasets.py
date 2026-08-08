@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from itertools import cycle
 
 import torch
@@ -32,10 +33,22 @@ def _stream(repo: str, split: str, seed: int):
 
 
 def _tokens(tokenizer, row) -> list[int]:
+    messages = [
+        json.loads(message) if isinstance(message, str) else message for message in row["messages"]
+    ]
     kwargs = {"tokenize": True, "add_generation_prompt": False}
     if row.get("tools"):
-        kwargs["tools"] = row["tools"]
-    encoded = tokenizer.apply_chat_template(row["messages"], **kwargs)
+        tools = []
+        for value in row["tools"]:
+            tool = json.loads(value) if isinstance(value, str) else value
+            function = tool.get("function")
+            if function and isinstance(function.get("parameters"), str):
+                tool = dict(tool)
+                tool["function"] = dict(function)
+                tool["function"]["parameters"] = json.loads(function["parameters"])
+            tools.append(tool)
+        kwargs["tools"] = tools
+    encoded = tokenizer.apply_chat_template(messages, **kwargs)
     if isinstance(encoded, torch.Tensor):
         encoded = encoded.tolist()
     return encoded
