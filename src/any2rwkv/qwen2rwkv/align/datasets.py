@@ -87,6 +87,8 @@ def _tokens(tokenizer, row) -> list[int]:
             tools.append(tool)
         kwargs["tools"] = tools
     encoded = tokenizer.apply_chat_template(messages, **kwargs)
+    if hasattr(encoded, "keys"):
+        encoded = encoded["input_ids"]
     if isinstance(encoded, torch.Tensor):
         encoded = encoded.tolist()
     return encoded
