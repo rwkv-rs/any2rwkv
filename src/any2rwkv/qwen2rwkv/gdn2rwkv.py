@@ -68,9 +68,9 @@ def _rwkv_trace(r, k, v, erase, log_decay):
     outputs = []
     for token in range(length):
         kt = k[:, token].float()
-        state = state * log_decay[:, token].float().exp()[..., None]
+        state = state * log_decay[:, token].float().exp()[..., None, None]
         memory = torch.einsum("bhij,bhj->bhi", state, kt)
-        state = state - erase[:, token].float()[..., None] * torch.einsum(
+        state = state - erase[:, token].float()[..., None, None] * torch.einsum(
             "bhi,bhj->bhij", memory, kt
         )
         state = state + torch.einsum("bhi,bhj->bhij", v[:, token].float(), kt)
