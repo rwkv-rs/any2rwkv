@@ -19,6 +19,12 @@ GQA = "full_attention"
 _SOURCE_TYPES = [GDN, GDN, GDN, GQA] * 6
 
 
+def _orthogonal_(parameter: torch.Tensor, gain: float) -> None:
+    value = torch.empty_like(parameter, dtype=torch.float32)
+    nn.init.orthogonal_(value, gain=gain)
+    parameter.copy_(value)
+
+
 class Qwen2RWKVConfig(Qwen3_5TextConfig):
     """The one supported Qwen3.5-2B text geometry."""
 
@@ -240,9 +246,9 @@ class Qwen2RWKVTimeMix(nn.Module):
             for name in ("w1", "a1", "v1", "g1"):
                 getattr(self, name).zero_()
             for name in ("w2", "a2", "v2", "g2"):
-                nn.init.orthogonal_(getattr(self, name), gain=0.1)
+                _orthogonal_(getattr(self, name), gain=0.1)
             for module, gain in ((self.receptance, 1.0), (self.key, 0.1), (self.value_base, 1.0)):
-                nn.init.orthogonal_(module.weight, gain=gain)
+                _orthogonal_(module.weight, gain=gain)
             self.value_expand.weight.zero_()
             self.value_expand.weight[:c].copy_(torch.eye(c))
             self.output.weight.zero_()
