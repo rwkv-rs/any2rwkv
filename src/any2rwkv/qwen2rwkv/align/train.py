@@ -72,6 +72,33 @@ def _teacher_layer(source_text, layer_idx, hidden):
     )
 
 
+def _teacher_mixer(source_text, layer_idx, hidden):
+    layer = source_text.layers[layer_idx]
+    normalized = layer.input_layernorm(hidden)
+    mask = torch.ones(hidden.shape[:2], dtype=torch.bool, device=hidden.device)
+    if source_text.config.layer_types[layer_idx] == "linear_attention":
+        return layer.linear_attn(normalized, attention_mask=mask)
+    _, embeddings = _position(source_text, normalized)
+    return layer.self_attn(
+        normalized,
+        position_embeddings=embeddings,
+        attention_mask=_causal(normalized),
+        past_key_values=None,
+    )[0]
+
+
+def _student_mixer(student, layer_idx, hidden):
+    layer = student.model.layers[layer_idx]
+    normalized = layer.input_layernorm(hidden)
+    v_first = None if layer_idx == 0 else torch.zeros_like(normalized)
+    return layer.tmix(
+        normalized,
+        v_first,
+        None,
+        torch.ones(hidden.shape[:2], dtype=torch.bool, device=hidden.device),
+    )[0]
+
+
 def _freeze_value_residual(tmix) -> None:
     tmix.value_residual_scale.data.zero_()
     for parameter in (tmix.v0, tmix.v1, tmix.v2, tmix.value_residual_scale):
@@ -108,6 +135,59 @@ def _mean(value: torch.Tensor, world: int):
         dist.all_reduce(value)
         value /= world
     return float(value)
+
+
+def _gather_calibration(hidden: torch.Tensor, world: int) -> torch.Tensor:
+    if world == 1:
+        return hidden
+    gathered = [torch.empty_like(hidden) for _ in range(world)]
+    dist.all_gather(gathered, hidden.contiguous())
+    return torch.cat(gathered)
+
+
+@torch.no_grad()
+def _evaluate_layer(source_text, student, layer_idx, hidden, world, device):
+    totals = torch.zeros(8, dtype=torch.float64, device=device)
+    layer = student.model.layers[layer_idx]
+    layer.train()
+    for batch in hidden.split(8):
+        batch = batch.to(device)
+        wanted_mixer = _teacher_mixer(source_text, layer_idx, batch).float()
+        actual_mixer = _student_mixer(student, layer_idx, batch).float()
+        wanted_block = _teacher_layer(source_text, layer_idx, batch).float()
+        v_first = None if layer_idx == 0 else torch.zeros_like(batch)
+        actual_block = layer(
+            batch,
+            v_first,
+            None,
+            torch.ones(batch.shape[:2], dtype=torch.bool, device=device),
+        )[0].float()
+        for offset, (actual, wanted) in enumerate(
+            ((actual_mixer, wanted_mixer), (actual_block, wanted_block))
+        ):
+            totals[offset * 4] += (actual - wanted).double().square().sum()
+            totals[offset * 4 + 1] += wanted.double().square().sum()
+            totals[offset * 4 + 2] += (actual.double() * wanted.double()).sum()
+            totals[offset * 4 + 3] += actual.double().square().sum()
+    if world > 1:
+        dist.all_reduce(totals)
+
+    def metrics(offset):
+        error, wanted_sq, dot, actual_sq = totals[offset : offset + 4]
+        return float(error / wanted_sq.clamp_min(1e-24)), float(
+            dot / (wanted_sq * actual_sq).clamp_min(1e-48).sqrt()
+        )
+
+    mixer_nmse, mixer_cosine = metrics(0)
+    block_nmse, block_cosine = metrics(4)
+    return {
+        "mixer_nmse": mixer_nmse,
+        "mixer_cosine": mixer_cosine,
+        "block_nmse": block_nmse,
+        "block_cosine": block_cosine,
+        "rows_per_rank": int(hidden.shape[0]),
+        "tokens_per_rank": int(hidden.shape[0] * hidden.shape[1]),
+    }
 
 
 def _completed_layers(output: Path) -> int:
@@ -161,7 +241,7 @@ class _LayerObjective(nn.Module):
         )[0]
 
 
-def _layerwise(source_text, student, ids, output, rank, world, device):
+def _layerwise(source_text, student, ids, output, rank, world, device, through_layer):
     cache = LastLayerCache(output / "cache", rank)
     completed = _completed_layers(output)
     for index in range(completed):
@@ -171,10 +251,20 @@ def _layerwise(source_text, student, ids, output, rank, world, device):
     if not cache.path("current").is_file():
         _rebuild_cache(student, ids, cache, completed, device)
 
-    for index in range(completed, 24):
+    if completed > through_layer:
+        return cache
+    for index in range(completed, through_layer + 1):
         hidden_cache = cache.load()
-        calibration = hidden_cache[:8].to(device)
-        metrics = _initialize_layer(source_text, student, index, calibration)
+        if hidden_cache.shape[0] < 32:
+            raise ValueError("each rank needs at least 32 packed rows for isolated data splits")
+        calibration_local = hidden_cache[:8].to(device)
+        development = hidden_cache[8:16]
+        frozen_final = hidden_cache[16:24]
+        training = hidden_cache[24:]
+        calibration = _gather_calibration(calibration_local, world)
+        metrics = (
+            _initialize_layer(source_text, student, index, calibration) if rank == 0 else {}
+        )
         if world > 1:
             for parameter in student.model.layers[index].tmix.parameters():
                 dist.broadcast(parameter.data, 0)
@@ -193,10 +283,29 @@ def _layerwise(source_text, student, ids, output, rank, world, device):
             betas=(0.9, 0.99),
             weight_decay=0.1,
         )
-        loader = DataLoader(TensorDataset(hidden_cache), batch_size=8, shuffle=False)
-        scheduler = _schedule(optimizer, 12 * len(loader))
-        history = []
-        for epoch in range(12):
+        loader = DataLoader(TensorDataset(training), batch_size=8, shuffle=False)
+        max_epochs = 48
+        scheduler = _schedule(optimizer, max_epochs * len(loader))
+        zero_development = _evaluate_layer(
+            source_text, student, index, development, world, device
+        )
+        if rank == 0:
+            print(
+                {
+                    "layer": index,
+                    "split": "development",
+                    "stage": "zero_step",
+                    **zero_development,
+                    **metrics,
+                },
+                flush=True,
+            )
+        best_nmse = zero_development["block_nmse"]
+        best_state = {
+            name: value.detach().cpu().clone() for name, value in tmix.state_dict().items()
+        }
+        last_train_nmse = math.inf
+        for epoch in range(max_epochs):
             total = torch.zeros((), device=device)
             for (hidden,) in loader:
                 hidden = hidden.to(device)
@@ -216,21 +325,64 @@ def _layerwise(source_text, student, ids, output, rank, world, device):
                 tmix.value_residual_scale.data.zero_()
                 total += loss.detach() / len(loader)
             average = _mean(total, world)
-            history.append(average)
-            if epoch >= 2 and all(
-                (history[j - 1] - history[j]) / max(abs(history[j - 1]), 1e-12) < 0.005
-                for j in (len(history) - 2, len(history) - 1)
-            ):
+            last_train_nmse = average
+            development_metrics = _evaluate_layer(
+                source_text, student, index, development, world, device
+            )
+            if development_metrics["block_nmse"] < best_nmse:
+                best_nmse = development_metrics["block_nmse"]
+                best_state = {
+                    name: value.detach().cpu().clone()
+                    for name, value in tmix.state_dict().items()
+                }
+            if rank == 0:
+                print(
+                    {
+                        "layer": index,
+                        "epoch": epoch,
+                        "train_block_nmse": average,
+                        "development_block_nmse": development_metrics["block_nmse"],
+                        "development_mixer_nmse": development_metrics["mixer_nmse"],
+                    },
+                    flush=True,
+                )
+            if best_nmse <= 1e-3:
                 break
+        tmix.load_state_dict(best_state)
+        development_metrics = _evaluate_layer(
+            source_text, student, index, development, world, device
+        )
+        if development_metrics["block_nmse"] > 1e-3:
+            raise RuntimeError(
+                f"layer {index} development block NMSE "
+                f"{development_metrics['block_nmse']:.8g} exceeds 1e-3 after {max_epochs} epochs"
+            )
+        final_metrics = _evaluate_layer(
+            source_text, student, index, frozen_final, world, device
+        )
+        if rank == 0:
+            print(
+                {
+                    "layer": index,
+                    "split": "frozen_final",
+                    "train_block_nmse": last_train_nmse,
+                    **final_metrics,
+                },
+                flush=True,
+            )
+        if final_metrics["block_nmse"] > 1e-3:
+            raise RuntimeError(
+                f"layer {index} frozen-final block NMSE "
+                f"{final_metrics['block_nmse']:.8g} exceeds 1e-3"
+            )
         if rank == 0:
             _save_layer(output, index, tmix)
-            print({"layer": index, "nmse": history[-1], **metrics}, flush=True)
         if world > 1:
             dist.barrier()
         layer.train()
         chunks = []
         with torch.no_grad():
-            for (hidden,) in loader:
+            for hidden in hidden_cache.split(8):
                 chunks.append(
                     wrapper.module(hidden.to(device)).cpu()
                     if world > 1
@@ -383,7 +535,13 @@ def _fresh_acceptance(output: Path) -> bool:
     return subprocess.run(command, check=False).returncode == 0
 
 
-def convert_qwen3_5_2b(source: str, output: str, agentic: str, math_dataset: str):
+def convert_qwen3_5_2b(
+    source: str,
+    output: str,
+    agentic: str,
+    math_dataset: str,
+    through_layer: int = 23,
+):
     rank, world, device = _distributed()
     output_path = Path(output).resolve()
     if output_path == Path(source).resolve():
@@ -408,7 +566,25 @@ def convert_qwen3_5_2b(source: str, output: str, agentic: str, math_dataset: str
     source_outer, source_text = load_qwen_teacher(source, torch.bfloat16, device)
     student = build_qwen2rwkv(source_outer, source_text).to(device=device, dtype=torch.bfloat16)
     local_ids = packed.input_ids[rank::world].contiguous()
-    _layerwise(source_text, student, local_ids, output_path, rank, world, device)
+    if not 0 <= through_layer < student.config.num_hidden_layers:
+        raise ValueError(
+            f"through_layer must be in [0, {student.config.num_hidden_layers - 1}]"
+        )
+    _layerwise(
+        source_text,
+        student,
+        local_ids,
+        output_path,
+        rank,
+        world,
+        device,
+        through_layer,
+    )
+    if through_layer < student.config.num_hidden_layers - 1:
+        if world > 1:
+            dist.barrier()
+            dist.destroy_process_group()
+        return
     _global_kl(
         source_outer, source_text, student, local_ids, tokenizer, output_path, rank, world, device
     )
@@ -485,6 +661,7 @@ def main():
     parser.add_argument("--math", dest="math_dataset", default="nvidia/Nemotron-SFT-Math-v4")
     parser.add_argument("--accept-only", action="store_true")
     parser.add_argument("--global-kl-only", action="store_true")
+    parser.add_argument("--through-layer", type=int, default=23)
     args = parser.parse_args()
     if args.accept_only:
         raise SystemExit(0 if _accept(Path(args.output)) else 1)
@@ -504,7 +681,13 @@ def main():
     if args.global_kl_only:
         continue_global_kl(args.source, args.output)
         return
-    convert_qwen3_5_2b(args.source, args.output, args.agentic, args.math_dataset)
+    convert_qwen3_5_2b(
+        args.source,
+        args.output,
+        args.agentic,
+        args.math_dataset,
+        args.through_layer,
+    )
 
 
 if __name__ == "__main__":

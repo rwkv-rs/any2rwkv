@@ -74,8 +74,53 @@ def _rwkv_trace(r, k, v, erase, log_decay):
             "bhi,bhj->bhij", memory, kt
         )
         state = state + torch.einsum("bhi,bhj->bhij", v[:, token].float(), kt)
-        outputs.append(torch.einsum("bhi,bhij->bhj", r[:, token].float(), state))
+        outputs.append(torch.einsum("bhij,bhj->bhi", state, r[:, token].float()))
     return torch.stack(outputs, 1)
+
+
+def fit_native_gate(
+    target,
+    current: torch.Tensor,
+    previous: torch.Tensor,
+    wanted: torch.Tensor,
+) -> None:
+    """Fit the actual ``sigmoid(x_g @ g1) @ g2`` gate parameterization."""
+    ratio, full = fit_time_mix(current, previous, wanted)
+    first, second = truncated_map(full, target.config.gate_low_rank_dim)
+    target.x_g.copy_(ratio.view(1, 1, -1).to(target.x_g))
+    target.g1.copy_(first.to(target.g1))
+    mixed = current.float() + (previous.float() - current.float()) * ratio
+    features = torch.sigmoid(mixed @ target.g1.float())
+    target.g2.copy_(ridge(features, wanted).to(target.g2))
+
+
+def refit_native_output(
+    target,
+    normalized_hidden: torch.Tensor,
+    source_output: torch.Tensor,
+) -> float:
+    """Fit output projection from the real FlashRWKV2 pre-output activation."""
+    captured: list[torch.Tensor] = []
+
+    def capture(_module, arguments):
+        captured.append(arguments[0].detach())
+
+    hook = target.output.register_forward_pre_hook(capture)
+    try:
+        v_first = None if target.layer_idx == 0 else torch.zeros_like(normalized_hidden)
+        target(normalized_hidden, v_first, None, torch.ones_like(normalized_hidden[..., 0]))
+    finally:
+        hook.remove()
+    if len(captured) != 1:
+        raise RuntimeError(f"expected one native output activation, got {len(captured)}")
+    target.output.weight.copy_(
+        ridge(captured[0], source_output.float()).T.to(target.output.weight)
+    )
+    fitted = target.output(captured[0]).float()
+    return float(
+        (fitted - source_output.float()).square().mean()
+        / (source_output.float().square().mean() + 1e-12)
+    )
 
 
 @torch.no_grad()
@@ -112,6 +157,9 @@ def initialize_gdn_layer(source, target, normalized_hidden: torch.Tensor) -> dic
     target.value_expand.weight.copy_(
         torch.eye(2048, device=x.device, dtype=target.value_expand.weight.dtype)
     )
+    target.k_k.fill_(1)
+    target.k_a.zero_()
+    target.r_k.zero_()
 
     decay_target = _native_decay_inverse(log_decay[..., None].expand(-1, -1, -1, 128).flatten(2))
     a_target = torch.logit(erase)[..., None].expand(-1, -1, -1, 128).flatten(2)
@@ -124,28 +172,39 @@ def initialize_gdn_layer(source, target, normalized_hidden: torch.Tensor) -> dic
         getattr(target, f"{stem}2").copy_(second.to(ratio))
 
     source_gate = F.silu(source.in_proj_z(x).float())
-    _, first, second = _low_rank_target(x, source_gate, target.config.gate_low_rank_dim)
-    target.g1.copy_(first.to(target.g1))
-    target.g2.copy_(second.to(target.g2))
+    fit_native_gate(target, x, previous, source_gate)
 
     raw = _rwkv_trace(read, k, write, erase, log_decay)
     normed = F.group_norm(
-        raw.flatten(2).transpose(1, 2),
+        raw.reshape(batch * length, -1),
         16,
         source.norm.weight.float().repeat(16),
         None,
         source.layer_norm_epsilon,
-    ).transpose(1, 2)
+    ).view(batch, length, -1)
     pre_output = normed * source_gate
     source_output = source(x).float()
-    target.output.weight.copy_(ridge(pre_output, source_output).T.to(target.output.weight))
     target.ln_x.weight.copy_(source.norm.weight.repeat(16).to(target.ln_x.weight))
     target.ln_x.bias.zero_()
     target.value_residual_scale.zero_()
+    analytic_output = source.out_proj(pre_output.to(source.out_proj.weight.dtype)).float()
+    analytic_output_nmse = float(
+        (analytic_output - source_output).square().mean()
+        / (source_output.square().mean() + 1e-12)
+    )
+    native_output_fit_nmse = refit_native_output(target, x, source_output)
     return {
         "decay_clipped_fraction": float((log_decay > -0.500001).float().mean()),
+        "analytic_pre_output_nmse": analytic_output_nmse,
+        "native_output_fit_nmse": native_output_fit_nmse,
         "trace_tokens": float(batch * length),
     }
 
 
-__all__ = ["initialize_gdn_layer", "ridge", "truncated_map"]
+__all__ = [
+    "fit_native_gate",
+    "initialize_gdn_layer",
+    "refit_native_output",
+    "ridge",
+    "truncated_map",
+]
