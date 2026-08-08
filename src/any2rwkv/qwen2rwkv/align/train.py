@@ -389,9 +389,18 @@ def convert_qwen3_5_2b(source: str, output: str, agentic: str, math_dataset: str
         raise ValueError("output must not overwrite the source checkpoint")
     output_path.mkdir(parents=True, exist_ok=True)
     tokenizer = AutoTokenizer.from_pretrained(source)
+    packed_path = output_path / "packed_sequences.pt"
     packed_objects = [
-        build_packed_sequences(tokenizer, agentic, math_dataset).input_ids if rank == 0 else None
+        (
+            torch.load(packed_path, map_location="cpu", weights_only=True)
+            if packed_path.exists()
+            else build_packed_sequences(tokenizer, agentic, math_dataset).input_ids
+        )
+        if rank == 0
+        else None
     ]
+    if rank == 0 and not packed_path.exists():
+        torch.save(packed_objects[0], packed_path)
     if world > 1:
         dist.broadcast_object_list(packed_objects, src=0, device=device)
     packed = PackedSequences(packed_objects[0])
