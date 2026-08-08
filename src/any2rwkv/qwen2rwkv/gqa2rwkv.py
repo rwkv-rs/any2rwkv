@@ -124,7 +124,9 @@ def initialize_gqa_layer(
     target.r_k.zero_()
     target.value_residual_scale.zero_()
     source_pre_output = exact_attention.transpose(1, 2).reshape(batch, length, channels)
-    source_output = source.o_proj(source_pre_output * source_gate).float()
+    source_output = source.o_proj(
+        (source_pre_output * source_gate).to(source.o_proj.weight.dtype)
+    ).float()
     native_output_fit_nmse = refit_native_output(target, x, source_output, source.o_proj.weight)
     return {
         "mean_exact_hazard": float(hazard.mean()),
