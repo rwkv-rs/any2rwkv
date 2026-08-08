@@ -419,7 +419,7 @@ class Qwen2RWKVTimeMix(nn.Module):
                 mixed.contiguous(),
                 mixed.contiguous(),
                 mixed.contiguous(),
-                zeros,
+                zeros.reshape(-1).contiguous(),
                 self.ln_x.weight.contiguous(),
                 self.ln_x.bias.contiguous(),
                 g,
