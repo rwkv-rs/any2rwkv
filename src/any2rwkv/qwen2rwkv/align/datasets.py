@@ -104,6 +104,7 @@ def build_packed_sequences(
     agentic_order = cycle(range(len(agentic_streams)))
     math_stream = _stream(math, "train", seed)
     buffer: list[int] = []
+    offset = 0
     packed: list[list[int]] = []
     choose_math = True
     while len(packed) < count:
@@ -113,9 +114,12 @@ def build_packed_sequences(
             row = next(agentic_streams[next(agentic_order)])
         choose_math = not choose_math
         buffer.extend(_tokens(tokenizer, row))
-        while len(buffer) >= context_length and len(packed) < count:
-            packed.append(buffer[:context_length])
-            del buffer[:context_length]
+        while len(buffer) - offset >= context_length and len(packed) < count:
+            packed.append(buffer[offset : offset + context_length])
+            offset += context_length
+        if offset >= len(buffer) // 2:
+            buffer = buffer[offset:]
+            offset = 0
     return PackedSequences(torch.tensor(packed, dtype=torch.long))
 
 
