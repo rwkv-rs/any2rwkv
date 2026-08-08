@@ -21,7 +21,7 @@ from transformers import AutoTokenizer
 
 from ..gdn2rwkv import initialize_gdn_layer
 from ..gqa2rwkv import initialize_gqa_layer
-from .datasets import build_packed_sequences
+from .datasets import PackedSequences, build_packed_sequences
 from .last_layer_cache import LastLayerCache
 from .model_qwen import load_qwen_teacher
 from .model_qwen2rwkv import build_qwen2rwkv
@@ -389,7 +389,12 @@ def convert_qwen3_5_2b(source: str, output: str, agentic: str, math_dataset: str
         raise ValueError("output must not overwrite the source checkpoint")
     output_path.mkdir(parents=True, exist_ok=True)
     tokenizer = AutoTokenizer.from_pretrained(source)
-    packed = build_packed_sequences(tokenizer, agentic, math_dataset)
+    packed_objects = [
+        build_packed_sequences(tokenizer, agentic, math_dataset).input_ids if rank == 0 else None
+    ]
+    if world > 1:
+        dist.broadcast_object_list(packed_objects, src=0, device=device)
+    packed = PackedSequences(packed_objects[0])
     source_outer, source_text = load_qwen_teacher(source, torch.bfloat16, device)
     student = build_qwen2rwkv(source_outer, source_text).to(device=device, dtype=torch.bfloat16)
     local_ids = packed.input_ids[rank::world].contiguous()
