@@ -321,7 +321,7 @@ class Qwen2RWKVTimeMix(nn.Module):
                 k.reshape(-1, 16, 256),
                 v.reshape(-1, 16, 256),
             ).view(x.shape[0], x.shape[1], 2048)
-            zeros = torch.zeros(2048, dtype=mixed.dtype, device=mixed.device)
+            zeros = torch.zeros(8, 256, dtype=mixed.dtype, device=mixed.device)
             mixed = flash.pretrain_tmix_lnx_rkvres_xg_bf16(
                 mixed.contiguous(),
                 mixed.contiguous(),
@@ -413,7 +413,7 @@ class Qwen2RWKVTimeMix(nn.Module):
             mixed = self._pair_sum(
                 raw.view(-1, 16, 256), r.view(-1, 16, 256), k.view(-1, 16, 256), v.view(-1, 16, 256)
             )
-            zeros = torch.zeros(2048, dtype=x.dtype, device=x.device)
+            zeros = torch.zeros(8, 256, dtype=x.dtype, device=x.device)
             mixed = flash.infer_tmix_lnx_rkvres_xg_forward_varlen(
                 mixed.contiguous(),
                 mixed.contiguous(),
