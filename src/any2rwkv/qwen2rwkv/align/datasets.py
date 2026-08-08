@@ -27,7 +27,7 @@ class PackedSequences(Dataset):
 
 
 def _stream(repo: str, split: str, seed: int):
-    if split in AGENTIC_SPLITS:
+    if split in ("search", "tool_calling"):
         data_files = hf_hub_download(
             repo,
             f"data/{split}.parquet",
