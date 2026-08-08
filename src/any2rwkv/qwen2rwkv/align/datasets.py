@@ -7,9 +7,11 @@ from itertools import cycle
 
 import torch
 from datasets import load_dataset
+from huggingface_hub import hf_hub_download
 from torch.utils.data import Dataset
 
 AGENTIC_SPLITS = ("interactive_agent", "search", "tool_calling")
+AGENTIC_PARQUET_REVISION = "4fb69cd40dbf36da60c73321e094e093946e60e9"
 
 
 class PackedSequences(Dataset):
@@ -25,10 +27,21 @@ class PackedSequences(Dataset):
 
 
 def _stream(repo: str, split: str, seed: int):
+    if split in AGENTIC_SPLITS:
+        data_files = hf_hub_download(
+            repo,
+            f"data/{split}.parquet",
+            repo_type="dataset",
+            revision=AGENTIC_PARQUET_REVISION,
+        )
+        builder = "parquet"
+    else:
+        data_files = f"hf://datasets/{repo}/data/{split}.jsonl"
+        builder = "json"
     return iter(
         load_dataset(
-            "json",
-            data_files=f"hf://datasets/{repo}/data/{split}.jsonl",
+            builder,
+            data_files=data_files,
             split="train",
             streaming=True,
         ).shuffle(seed=seed, buffer_size=1_024)
