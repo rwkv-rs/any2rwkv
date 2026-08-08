@@ -36,6 +36,27 @@ def _tokens(tokenizer, row) -> list[int]:
     messages = [
         json.loads(message) if isinstance(message, str) else message for message in row["messages"]
     ]
+    for index, message in enumerate(messages):
+        if message.get("tool_calls"):
+            message = dict(message)
+            calls = (
+                json.loads(message["tool_calls"])
+                if isinstance(message["tool_calls"], str)
+                else message["tool_calls"]
+            )
+            message["tool_calls"] = []
+            for value in calls:
+                call = json.loads(value) if isinstance(value, str) else value
+                function = call.get("function")
+                if function and isinstance(function.get("arguments"), str):
+                    call = dict(call)
+                    call["function"] = dict(function)
+                    call["function"]["arguments"] = json.loads(function["arguments"])
+                elif isinstance(call.get("arguments"), str):
+                    call = dict(call)
+                    call["arguments"] = json.loads(call["arguments"])
+                message["tool_calls"].append(call)
+            messages[index] = message
     kwargs = {"tokenize": True, "add_generation_prompt": False}
     if row.get("tools"):
         tools = []
