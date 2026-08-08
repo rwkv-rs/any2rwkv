@@ -46,7 +46,7 @@ def _stream(repo: str, split: str, seed: int):
             streaming=True,
         )
         .shuffle(seed=seed, buffer_size=128)
-        .repeat()
+        .repeat(None)
     )
 
 
