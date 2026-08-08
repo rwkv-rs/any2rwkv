@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 RIDGE_SCALE = 1e-4
+W_SCALE = -torch.exp(torch.tensor(-0.5)).item()
 
 
 def ridge(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -51,8 +52,8 @@ def _previous(x: torch.Tensor) -> torch.Tensor:
 
 
 def _native_decay_inverse(log_decay: torch.Tensor) -> torch.Tensor:
-    reachable = log_decay.clamp(max=-0.500001)
-    return -torch.log(torch.expm1(-reachable - 0.5))
+    retention_log = log_decay.clamp(min=W_SCALE + 1e-6, max=-1e-6)
+    return torch.logit((retention_log / W_SCALE).clamp(1e-6, 1 - 1e-6))
 
 
 def _low_rank_target(x: torch.Tensor, y: torch.Tensor, rank: int):
@@ -68,10 +69,11 @@ def _rwkv_trace(r, k, v, erase, log_decay):
     outputs = []
     for token in range(length):
         kt = k[:, token].float()
-        state = state * log_decay[:, token].float().exp()[..., None, None]
         memory = torch.einsum("bhij,bhj->bhi", state, kt)
-        state = state - erase[:, token].float()[..., None, None] * torch.einsum(
-            "bhi,bhj->bhij", memory, kt
+        state = (
+            state * log_decay[:, token].float().exp()[..., None, None]
+            - erase[:, token].float()[..., None, None]
+            * torch.einsum("bhi,bhj->bhij", memory, kt)
         )
         state = state + torch.einsum("bhi,bhj->bhij", v[:, token].float(), kt)
         outputs.append(torch.einsum("bhij,bhj->bhi", state, r[:, token].float()))
@@ -149,7 +151,7 @@ def initialize_gdn_layer(source, target, normalized_hidden: torch.Tensor) -> dic
     read = q / 128**0.5
     previous = _previous(x)
 
-    for name, wanted in (("r", read.flatten(2)), ("k", k.flatten(2)), ("v", write.flatten(2))):
+    for name, wanted in (("r", q.flatten(2)), ("k", k.flatten(2)), ("v", write.flatten(2))):
         ratio, fitted = fit_time_mix(x, previous, wanted)
         getattr(target, f"x_{name}").copy_(ratio.view(1, 1, -1))
         module = {"r": target.receptance, "k": target.key, "v": target.value_base}[name]
@@ -194,7 +196,7 @@ def initialize_gdn_layer(source, target, normalized_hidden: torch.Tensor) -> dic
     )
     native_output_fit_nmse = refit_native_output(target, x, source_output)
     return {
-        "decay_clipped_fraction": float((log_decay > -0.500001).float().mean()),
+        "decay_clipped_fraction": float((log_decay < W_SCALE).float().mean()),
         "analytic_pre_output_nmse": analytic_output_nmse,
         "native_output_fit_nmse": native_output_fit_nmse,
         "trace_tokens": float(batch * length),

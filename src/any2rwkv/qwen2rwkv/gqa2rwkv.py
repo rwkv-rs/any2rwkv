@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb, repeat_kv
 
-from .gdn2rwkv import fit_native_gate, fit_time_mix, refit_native_output
+from .gdn2rwkv import _native_decay_inverse, fit_native_gate, fit_time_mix, refit_native_output
 
 
 def _previous(x: torch.Tensor) -> torch.Tensor:
@@ -69,8 +69,7 @@ def initialize_gqa_layer(
             target.value_expand.weight[target_slice, source_slice].copy_(eye)
 
     log_decay = (-1 / mean_lag).repeat_interleave(2).repeat_interleave(256)
-    log_decay = log_decay.clamp(max=-0.500001)
-    target.w0.copy_((-torch.log(torch.expm1(-log_decay - 0.5))).view(1, 1, -1))
+    target.w0.copy_(_native_decay_inverse(log_decay).view(1, 1, -1))
     target.w1.zero_()
     target.w2.zero_()
     target.a0.copy_(

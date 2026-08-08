@@ -285,7 +285,7 @@ class Qwen2RWKVTimeMix(nn.Module):
             ),
         )
         r = self.receptance(xr)
-        decay = -F.softplus(-(self.w0 + (torch.tanh(xw @ self.w1) @ self.w2))) - 0.5
+        decay = self.w0 + (torch.tanh(xw @ self.w1) @ self.w2)
         k = self.key(xk)
         v, v_first = self._value(xv, v_first)
         a = flash.pretrain_tmix_a_gate_bf16(
