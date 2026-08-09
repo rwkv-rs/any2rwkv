@@ -7,8 +7,9 @@
 
 本文只讨论 `full_attention` 的 GQA→RWKV7。Qwen3.5-2B 的 source
 Query head dimension 是 256，因此 target 也使用 256 维 native head；每个
-source Query head 配两个完整的 \(256\times256\) 状态。GDN 保持它自己的原生
-`128×128` geometry，不属于本文的改造范围。
+source Query head 配两个完整的 \(256\times256\) 状态。GDN 使用保留完整 source
+shell、只把 recurrence 交给 D128 WKV 的 hybrid runtime，不属于本文的 GQA 数学
+改造范围。
 
 我们的目标不是从随机 RWKV 开始模仿 Qwen，而是尽量把一个已经训练好的 GQA
 层直接“编译”为 RWKV7：先找到 Softmax Attention 的递推近似，再把递推式写成
@@ -385,16 +386,15 @@ $$
 乘积使问题变成双线性，不能谎称为一次联合线性回归。因此实现先闭式 ridge
 `output`，再固定它求 `r_k`，随后重新解 `output`，最多交替四轮。
 
-整个交替候选只按 development 原子安装；当前还没有执行 frozen-final 或真实
-PRO6000/BF16 复验，因此本文只说明算法与实现边界，不报告收益数字。旧
-Helicopter 的 development/final 数字也不能作为本仓库当前验收证据。
+整个交替候选只按 development 原子安装。frozen-final 只在候选和 checkpoint
+固定后评估；本文说明当前算法与实现边界，不把静态检查、CPU reference、GPU
+kernel 验证和完整 layerwise acceptance 混为同一种证据。
 
 ## 7. 当前逐层对齐边界
 
-当前 runner 解冻本层完整标准 RWKV7 TMix，而不是旧文档所说的仅优化 24,576 个
-小向量。teacher、Cmix/MLP、decoder Norm、embedding、其它层和 value-residual
-保持冻结；optimizer-train 只更新参数，development 负责选择 checkpoint，冻结
-final 只在方法和参数冻结后评估一次。
+当前 runner 解冻本层完整标准 RWKV7 TMix。teacher、Cmix/MLP、decoder Norm、
+embedding、其它层和 value-residual 保持冻结；optimizer-train 只更新参数，
+development 负责选择 checkpoint，冻结 final 只在方法和参数冻结后评估一次。
 
 每个 rank 的 rows `0:8`/`8:16`/`16:24`/`24:` 分别固定为 calibration、
 development、frozen-final 和 optimizer-train。本阶段以 `--through-layer 3` 正常

@@ -1,11 +1,18 @@
 # Any2RWKV
 
-Any2RWKV converts the Qwen3.5-2B text backbone's 18 GDN and 6 GQA token mixers
-to RWKV-7 while retaining Qwen embeddings, RMSNorm, MLP, residual structure,
-tokenizer and tied LM head. It uses one mathematical initializer per source
-layer type, greedy block-output alignment, then a frozen-teacher logits-KL TMix
-fine-tune. Value residual is present in every target layer, remains exactly zero
-during initialization/layerwise alignment, and opens only in the final stage.
+Any2RWKV converts the Qwen3.5-2B text backbone to a hybrid RWKV model. Each GDN
+layer keeps its complete source frontend, control projections,
+`RMSNormGated`, and `out_proj`; only its matrix-state recurrence is executed by
+RWKV-7 WKV. Each GQA layer is still converted to a canonical RWKV-7 TMix. Qwen
+embeddings, decoder RMSNorm, MLP, residual structure, tokenizer, and tied LM
+head remain unchanged.
+
+GDN initialization is a strict source `state_dict` copy plus recurrence and
+Clamp-W diagnostics. GQA keeps its mathematical compiler. Both paths then use
+greedy block-output alignment followed by frozen-teacher logits-KL TMix
+fine-tuning. RWKV value residual belongs only to GQA layers: it remains zero
+during initialization/layerwise alignment and opens for later GQA layers only
+in the final stage.
 
 The product path requires the pinned `rwkv-rs/transformers-rwkv` revision and
 FlashRWKV2's native D128/D256 training and FP16 inference kernels. There is no

@@ -6,7 +6,12 @@ from copy import deepcopy
 
 import torch
 
-from ..transformers.modeling_qwen2rwkv import Qwen2RWKVConfig, Qwen2RWKVForCausalLM
+from ..transformers.modeling_qwen2rwkv import (
+    GDN_CHECKPOINT_SCHEMA,
+    GDN_MODE,
+    Qwen2RWKVConfig,
+    Qwen2RWKVForCausalLM,
+)
 
 
 def _config(source_config) -> Qwen2RWKVConfig:
@@ -39,6 +44,8 @@ def _config(source_config) -> Qwen2RWKVConfig:
     values = {name: deepcopy(getattr(source_config, name)) for name in keys}
     values["source_layer_types"] = list(source_config.layer_types)
     values["layer_types"] = list(source_config.layer_types)
+    values["gdn_mode"] = GDN_MODE
+    values["gdn_checkpoint_schema"] = GDN_CHECKPOINT_SCHEMA
     return Qwen2RWKVConfig(**values)
 
 
@@ -94,6 +101,8 @@ def build_qwen2rwkv(source_outer, source_text) -> Qwen2RWKVForCausalLM:
             source_layer.post_attention_layernorm.state_dict()
         )
         target_layer.mlp.load_state_dict(source_layer.mlp.state_dict())
+        if source_layer.block_type == "linear_attention":
+            target_layer.tmix.load_state_dict(source_layer.linear_attn.state_dict(), strict=True)
     target.lm_head.load_state_dict(source_outer.lm_head.state_dict())
     target.tie_weights()
     return target

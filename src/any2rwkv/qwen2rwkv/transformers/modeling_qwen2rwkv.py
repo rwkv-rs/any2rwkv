@@ -1,8 +1,9 @@
-"""Qwen3.5 text blocks with every token mixer replaced by RWKV-7."""
+"""Qwen3.5 text blocks with hybrid GDN/WKV and converted GQA mixers."""
 
 from __future__ import annotations
 
 import importlib
+import math
 
 import torch
 import torch.nn.functional as F
@@ -13,15 +14,23 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5GatedDeltaNet,
     Qwen3_5MLP,
     Qwen3_5RMSNorm,
     Qwen3_5TextRotaryEmbedding,
+    apply_mask_to_padding_states,
     apply_rotary_pos_emb,
+    causal_conv1d_fn,
+    causal_conv1d_update,
 )
 
 GDN = "linear_attention"
 GQA = "full_attention"
 _SOURCE_TYPES = [GDN, GDN, GDN, GQA] * 6
+GDN_MODE = "source_shell_wkv7"
+GDN_CHECKPOINT_SCHEMA = "source_gdn_state_dict_v1"
+CLAMP_W_EPSILON = 1e-4
+W_SCALE = -math.exp(-0.5)
 
 
 def _orthogonal_(parameter: torch.Tensor, gain: float) -> None:
@@ -41,12 +50,36 @@ class Qwen2RWKVConfig(Qwen3_5TextConfig):
     gate_low_rank_dim: int = 224
     group_norm_epsilon: float = 1e-5
     value_residual: bool = True
+    gdn_mode: str = GDN_MODE
+    gdn_checkpoint_schema: str = GDN_CHECKPOINT_SCHEMA
 
     def __post_init__(self, **kwargs):
         if self.source_layer_types is None:
             self.source_layer_types = list(self.layer_types or _SOURCE_TYPES)
         self.layer_types = list(self.source_layer_types)
+        if self.gdn_mode != GDN_MODE:
+            raise ValueError(f"unsupported GDN mode {self.gdn_mode!r}; expected {GDN_MODE!r}")
+        if self.gdn_checkpoint_schema != GDN_CHECKPOINT_SCHEMA:
+            raise ValueError(
+                "unsupported GDN checkpoint schema "
+                f"{self.gdn_checkpoint_schema!r}; expected {GDN_CHECKPOINT_SCHEMA!r}"
+            )
         super().__post_init__(**kwargs)
+
+    @classmethod
+    def from_dict(cls, config_dict, **kwargs):
+        source_types = config_dict.get("source_layer_types") or config_dict.get("layer_types", ())
+        if config_dict.get("model_type") == cls.model_type and GDN in source_types:
+            missing = {
+                "gdn_mode",
+                "gdn_checkpoint_schema",
+            }.difference(config_dict)
+            if missing:
+                raise ValueError(
+                    "legacy canonical-RWKV GDN artifact is incompatible with the "
+                    f"source-shell WKV runtime; missing config keys {sorted(missing)}"
+                )
+        return super().from_dict(config_dict, **kwargs)
 
     def geometry(self, layer_idx: int) -> tuple[int, int, int]:
         if self.source_layer_types[layer_idx] == GDN:
@@ -54,21 +87,28 @@ class Qwen2RWKVConfig(Qwen3_5TextConfig):
         return 16, 256, 2
 
 
-def _flash(mode: str, tensor: torch.Tensor):
+def _flash(mode: str, tensor: torch.Tensor, *, gdn: bool = False):
     try:
         module = importlib.import_module("flashrwkv2")
     except ImportError as error:
         raise RuntimeError(f"{mode} requires the pinned FlashRWKV2 provider") from error
-    required = (
-        (
+    if gdn and mode == "training":
+        required = ("pretrain_recurrent_bf16",)
+    elif gdn:
+        required = (
+            "prepare_recurrent_metadata",
+            "infer_recurrent_fp16_forward_varlen",
+        )
+    elif mode == "training":
+        required = (
             "pretrain_tmix_mix6_bf16",
             "pretrain_tmix_a_gate_bf16",
             "pretrain_tmix_kk_pre_bf16",
             "pretrain_recurrent_bf16",
             "pretrain_tmix_lnx_rkvres_xg_bf16",
         )
-        if mode == "training"
-        else (
+    else:
+        required = (
             "prepare_recurrent_metadata",
             "infer_tmix_mix6_forward_varlen",
             "infer_tmix_linear_attention_c2c_forward_varlen",
@@ -76,7 +116,6 @@ def _flash(mode: str, tensor: torch.Tensor):
             "infer_recurrent_fp16_forward_varlen",
             "infer_tmix_lnx_rkvres_xg_forward_varlen",
         )
-    )
     missing = [name for name in required if not callable(getattr(module, name, None))]
     if missing:
         raise RuntimeError(f"FlashRWKV2 is missing required public operators: {missing}")
@@ -128,7 +167,7 @@ class Qwen2RWKVCacheLayer(LinearAttentionLayer, CacheLayerMixin):
 
 
 class Qwen2RWKVCache(Cache):
-    """Per-layer shift/WKV state plus the shared current-token ``v_first``."""
+    """Per-layer Conv4-or-shift state, WKV state, elapsed state, and GQA ``v_first``."""
 
     def __init__(self, config: Qwen2RWKVConfig):
         super().__init__(layers=[Qwen2RWKVCacheLayer() for _ in range(config.num_hidden_layers)])
@@ -192,6 +231,158 @@ def _cache_states(cache: Qwen2RWKVCache, layer_idx: int, x: torch.Tensor, heads:
     return layer.conv_states[0].squeeze(-1), layer.recurrent_states[0], cache.elapsed[layer_idx]
 
 
+def _gdn_cache_states(cache: Qwen2RWKVCache, layer_idx: int, x: torch.Tensor, heads: int, dim: int):
+    batch = x.shape[0]
+    layer = cache.layers[layer_idx]
+    if not layer.is_recurrent_states_initialized[0]:
+        layer.lazy_initialization(
+            recurrent_states=torch.zeros(
+                batch, heads, dim, dim, dtype=torch.float16, device=x.device
+            ),
+            state_idx=0,
+        )
+    if cache.elapsed[layer_idx] is None:
+        cache.elapsed[layer_idx] = torch.zeros(batch, dtype=torch.int32, device=x.device)
+    return layer.recurrent_states[0], cache.elapsed[layer_idx]
+
+
+def _clamp_w_logits(log_decay: torch.Tensor, *, straight_through: bool) -> torch.Tensor:
+    ratio = log_decay.float() / W_SCALE
+    projected = ratio.clamp(CLAMP_W_EPSILON, 1 - CLAMP_W_EPSILON)
+    if straight_through:
+        projected = ratio + (projected - ratio).detach()
+    return torch.logit(projected)
+
+
+class Qwen2RWKVGatedDeltaNet(Qwen3_5GatedDeltaNet):
+    """Source Qwen3.5 GDN shell whose matrix recurrence is executed by RWKV-7 WKV."""
+
+    def _source_activations(
+        self,
+        hidden_states: torch.Tensor,
+        cache: Qwen2RWKVCache | None,
+        attention_mask: torch.Tensor | None,
+    ):
+        hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+        batch, length, _ = hidden_states.shape
+        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
+        use_precomputed = cache is not None and cache.has_previous_state(self.layer_idx)
+        if use_precomputed and length == 1 and not cache.layers[self.layer_idx].record_past:
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv,
+                cache.layers[self.layer_idx].conv_states[0],
+                self.conv1d.weight.squeeze(1),
+                self.conv1d.bias,
+                self.activation,
+            )
+        else:
+            if cache is not None:
+                mixed_qkv = cache.update_conv_state(
+                    mixed_qkv,
+                    self.layer_idx,
+                    conv_kernel_size=self.conv_kernel_size,
+                )
+            mixed_qkv = causal_conv1d_fn(
+                mixed_qkv,
+                self.conv1d.weight.squeeze(1),
+                self.conv1d.bias,
+                activation=self.activation,
+            )
+            if cache is not None:
+                mixed_qkv = mixed_qkv[:, :, -length:]
+        query, key, value = torch.split(
+            mixed_qkv.transpose(1, 2),
+            (self.key_dim, self.key_dim, self.value_dim),
+            dim=-1,
+        )
+        query = query.view(batch, length, self.num_k_heads, self.head_k_dim)
+        key = key.view(batch, length, self.num_k_heads, self.head_k_dim)
+        value = value.view(batch, length, self.num_v_heads, self.head_v_dim)
+        query = query * torch.rsqrt(query.square().sum(-1, keepdim=True) + 1e-6)
+        key = key * torch.rsqrt(key.square().sum(-1, keepdim=True) + 1e-6)
+        if self.num_v_heads // self.num_k_heads > 1:
+            repeats = self.num_v_heads // self.num_k_heads
+            query = query.repeat_interleave(repeats, dim=2)
+            key = key.repeat_interleave(repeats, dim=2)
+        beta = torch.sigmoid(self.in_proj_b(hidden_states))
+        log_decay = -self.A_log.float().exp() * F.softplus(
+            self.in_proj_a(hidden_states).float() + self.dt_bias.float()
+        )
+        z = self.in_proj_z(hidden_states).view(batch, length, self.num_v_heads, self.head_v_dim)
+        return query, key, value, beta, log_decay, z
+
+    def _wkv_inputs(self, query, key, value, beta, log_decay, *, training: bool):
+        retention = log_decay.exp()
+        read = query / math.sqrt(self.head_k_dim)
+        write = beta[..., None] * value
+        erase = -(beta.float() * retention)[..., None] * key.float()
+        decay = _clamp_w_logits(log_decay, straight_through=training)[..., None]
+        decay = decay.expand_as(key)
+        dtype = value.dtype
+        return tuple(
+            tensor.flatten(2).to(dtype).contiguous()
+            for tensor in (read, decay, key, write, key, erase)
+        )
+
+    def _source_boundary(self, raw: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        batch, length = raw.shape[:2]
+        mixed = self.norm(
+            raw.reshape(-1, self.head_v_dim),
+            z.reshape(-1, self.head_v_dim),
+        ).reshape(batch, length, self.value_dim)
+        return self.out_proj(mixed)
+
+    def _training_forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None):
+        flash = _flash("training", x, gdn=True)
+        if x.dtype != torch.bfloat16 or x.shape[1] % 16:
+            raise RuntimeError(
+                "training requires contiguous BF16 [B,T,2048] with T divisible by 16"
+            )
+        query, key, value, beta, log_decay, z = self._source_activations(x, None, attention_mask)
+        r, w, k, v, a, b = self._wkv_inputs(query, key, value, beta, log_decay, training=True)
+        raw = flash.pretrain_recurrent_bf16(r, w, k, v, a, b, head_size=self.head_v_dim)
+        return self._source_boundary(raw.view_as(value), z)
+
+    def _inference_forward(
+        self,
+        x: torch.Tensor,
+        cache: Qwen2RWKVCache,
+        attention_mask: torch.Tensor | None,
+    ):
+        flash = _flash("inference", x, gdn=True)
+        if x.dtype != torch.float16:
+            raise RuntimeError("inference requires a float16 checkpoint")
+        batch, length, _ = x.shape
+        query, key, value, beta, log_decay, z = self._source_activations(x, cache, attention_mask)
+        r, w, k, v, a, b = self._wkv_inputs(query, key, value, beta, log_decay, training=False)
+        state, elapsed = _gdn_cache_states(
+            cache, self.layer_idx, x, self.num_v_heads, self.head_v_dim
+        )
+        offsets, indices, ticket = cache.recurrent_metadata(flash, batch, length, x.device)
+        raw = flash.infer_recurrent_fp16_forward_varlen(
+            r.view(-1, self.num_v_heads, self.head_v_dim),
+            w.view(-1, self.num_v_heads, self.head_v_dim),
+            k.view(-1, self.num_v_heads, self.head_v_dim),
+            v.view(-1, self.num_v_heads, self.head_v_dim),
+            a.view(-1, self.num_v_heads, self.head_v_dim),
+            b.view(-1, self.num_v_heads, self.head_v_dim),
+            state_pool=state,
+            elapsed_state_pool=elapsed,
+            cu_seqlens=offsets,
+            state_indices=indices,
+            max_seqlen=length,
+            validated_metadata=ticket,
+        ).view_as(value)
+        return self._source_boundary(raw, z)
+
+    def forward(self, x, v_first=None, past_key_values=None, attention_mask=None):
+        if self.training:
+            return self._training_forward(x, attention_mask), v_first
+        if not isinstance(past_key_values, Qwen2RWKVCache):
+            raise TypeError("inference requires Qwen2RWKVCache")
+        return self._inference_forward(x, past_key_values, attention_mask), v_first
+
+
 class Qwen2RWKVTimeMix(nn.Module):
     """RWKV-7 TMix with per-layer D128/D256 recurrent geometry."""
 
@@ -226,9 +417,7 @@ class Qwen2RWKVTimeMix(nn.Module):
         self.output = nn.Linear(channels, channels, bias=False)
         norm_heads = 16 if self.states_per_head == 1 else 8
         self.ln_x = nn.GroupNorm(norm_heads, channels, eps=config.group_norm_epsilon)
-        self.rotary_emb = (
-            Qwen3_5TextRotaryEmbedding(config) if self.states_per_head == 2 else None
-        )
+        self.rotary_emb = Qwen3_5TextRotaryEmbedding(config) if self.states_per_head == 2 else None
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -266,10 +455,8 @@ class Qwen2RWKVTimeMix(nn.Module):
 
     def _value(self, xv: torch.Tensor, v_first: torch.Tensor | None):
         base = self.value_base(xv)
-        if self.layer_idx == 0:
-            return self.value_expand(base), base
         if v_first is None:
-            raise ValueError("v_first is required after layer 0")
+            return self.value_expand(base), base
         gate = torch.sigmoid(self.v0 + (xv @ self.v1) @ self.v2)
         base = base + self.value_residual_scale * gate * (v_first - base)
         return self.value_expand(base), v_first
@@ -401,7 +588,7 @@ class Qwen2RWKVTimeMix(nn.Module):
             r = r.reshape(-1, self.recurrent_width).contiguous()
             k = k.reshape(-1, self.recurrent_width).contiguous()
         base = linear(xv, self.value_base.weight.contiguous()).view(b, t, c)
-        if self.layer_idx == 0:
+        if v_first is None:
             v_first = base
         else:
             gate_v = torch.sigmoid(self.v0 + (xv.view(b, t, c) @ self.v1) @ self.v2)
@@ -487,7 +674,10 @@ class Qwen2RWKVDecoderLayer(nn.Module):
     def __init__(self, config: Qwen2RWKVConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
-        self.tmix = Qwen2RWKVTimeMix(config, layer_idx)
+        if config.source_layer_types[layer_idx] == GDN:
+            self.tmix = Qwen2RWKVGatedDeltaNet(config, layer_idx)
+        else:
+            self.tmix = Qwen2RWKVTimeMix(config, layer_idx)
         self.mlp = Qwen3_5MLP(config, config.intermediate_size)
         self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

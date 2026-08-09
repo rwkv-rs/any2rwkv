@@ -92,16 +92,17 @@ def _teacher_mixer(source_text, layer_idx, hidden):
 def _student_mixer(student, layer_idx, hidden):
     layer = student.model.layers[layer_idx]
     normalized = layer.input_layernorm(hidden)
-    v_first = None if layer_idx == 0 else torch.zeros_like(normalized)
     return layer.tmix(
         normalized,
-        v_first,
+        None,
         None,
         torch.ones(hidden.shape[:2], dtype=torch.bool, device=hidden.device),
     )[0]
 
 
 def _freeze_value_residual(tmix) -> None:
+    if not hasattr(tmix, "value_residual_scale"):
+        return
     tmix.value_residual_scale.data.zero_()
     for parameter in (tmix.v0, tmix.v1, tmix.v2, tmix.value_residual_scale):
         parameter.requires_grad_(False)
@@ -112,9 +113,7 @@ def _require_finite_tmix(tmix, layer_idx: int, stage: str, *, gradients: bool = 
         value = parameter.grad if gradients else parameter
         if value is not None and not torch.isfinite(value).all():
             kind = "gradient" if gradients else "parameter"
-            raise FloatingPointError(
-                f"non-finite layer {layer_idx} {kind} {name} during {stage}"
-            )
+            raise FloatingPointError(f"non-finite layer {layer_idx} {kind} {name} during {stage}")
 
 
 def _initialize_layer(source_text, student, layer_idx, hidden, selection_hidden):
@@ -137,7 +136,7 @@ def _initialize_layer(source_text, student, layer_idx, hidden, selection_hidden)
             selection_normalized,
             selection_embeddings,
         )
-    _freeze_value_residual(target)
+        _freeze_value_residual(target)
     return metrics
 
 
@@ -184,14 +183,10 @@ def _development_is_better(candidate: dict[str, float], best: dict[str, float]) 
     )
 
 
-def _require_finite_metrics(
-    metrics: dict[str, float], layer_idx: int, split: str
-) -> None:
+def _require_finite_metrics(metrics: dict[str, float], layer_idx: int, split: str) -> None:
     for name, value in metrics.items():
         if isinstance(value, float) and not math.isfinite(value):
-            raise FloatingPointError(
-                f"non-finite layer {layer_idx} {split} metric {name}: {value}"
-            )
+            raise FloatingPointError(f"non-finite layer {layer_idx} {split} metric {name}: {value}")
 
 
 @torch.no_grad()
@@ -204,10 +199,9 @@ def _evaluate_layer(source_text, student, layer_idx, hidden, world, device):
         wanted_mixer = _teacher_mixer(source_text, layer_idx, batch).float()
         actual_mixer = _student_mixer(student, layer_idx, batch).float()
         wanted_block = _teacher_layer(source_text, layer_idx, batch).float()
-        v_first = None if layer_idx == 0 else torch.zeros_like(batch)
         actual_block = layer(
             batch,
-            v_first,
+            None,
             None,
             torch.ones(batch.shape[:2], dtype=torch.bool, device=device),
         )[0].float()
@@ -252,6 +246,22 @@ def _save_layer(output: Path, layer_idx: int, tmix) -> None:
     save_file(tensors, (output / f"layer_{layer_idx:02d}.safetensors").as_posix())
 
 
+def _load_layer_checkpoint(output: Path, layer_idx: int, tmix) -> None:
+    path = output / f"layer_{layer_idx:02d}.safetensors"
+    state = load_file(path.as_posix())
+    expected = set(tmix.state_dict())
+    actual = set(state)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        raise RuntimeError(
+            f"layer {layer_idx} checkpoint schema is incompatible with the current "
+            "source-shell GDN runtime; use a new output directory "
+            f"(missing={missing}, unexpected={unexpected})"
+        )
+    tmix.load_state_dict(state, strict=True)
+
+
 def _rebuild_cache(student, ids, cache: LastLayerCache, completed: int, device):
     chunks = []
     with torch.no_grad():
@@ -264,10 +274,9 @@ def _rebuild_cache(student, ids, cache: LastLayerCache, completed: int, device):
         chunks = []
         with torch.no_grad():
             for hidden in cache.load().split(8):
-                value_first = None if index == 0 else torch.zeros_like(hidden, device=device)
                 output, _ = layer(
                     hidden.to(device),
-                    value_first,
+                    None,
                     None,
                     torch.ones(hidden.shape[:2], dtype=torch.bool, device=device),
                 )
@@ -282,10 +291,9 @@ class _LayerObjective(nn.Module):
         self.layer = layer
 
     def forward(self, hidden):
-        value_first = None if self.layer.layer_idx == 0 else torch.zeros_like(hidden)
         return self.layer(
             hidden,
-            value_first,
+            None,
             None,
             torch.ones(hidden.shape[:2], dtype=torch.bool, device=hidden.device),
         )[0]
@@ -295,9 +303,7 @@ def _layerwise(source_text, student, ids, output, rank, world, device, through_l
     cache = LastLayerCache(output / "cache", rank)
     completed = _completed_layers(output)
     for index in range(completed):
-        student.model.layers[index].tmix.load_state_dict(
-            load_file((output / f"layer_{index:02d}.safetensors").as_posix())
-        )
+        _load_layer_checkpoint(output, index, student.model.layers[index].tmix)
     if completed > through_layer:
         return cache
     # The contiguous layer checkpoints are the sole resume authority. Rebuilding
@@ -321,16 +327,15 @@ def _layerwise(source_text, student, ids, output, rank, world, device, through_l
             else {}
         )
         if rank == 0:
-            _require_finite_tmix(
-                student.model.layers[index].tmix, index, "zero-step compilation"
-            )
+            _require_finite_tmix(student.model.layers[index].tmix, index, "zero-step compilation")
         if world > 1:
             for parameter in student.model.layers[index].tmix.parameters():
                 dist.broadcast(parameter.data, 0)
         student.requires_grad_(False)
         tmix = student.model.layers[index].tmix
         tmix.requires_grad_(True)
-        _freeze_value_residual(tmix)
+        if student.config.source_layer_types[index] == "full_attention":
+            _freeze_value_residual(tmix)
         layer = student.model.layers[index].to(device).train()
         wrapper = _LayerObjective(layer)
         if world > 1:
@@ -349,9 +354,7 @@ def _layerwise(source_text, student, ids, output, rank, world, device, through_l
         loader = DataLoader(TensorDataset(training), batch_size=8, shuffle=False)
         max_epochs = 48
         scheduler = _schedule(optimizer, max_epochs * len(loader))
-        zero_development = _evaluate_layer(
-            source_text, student, index, development, world, device
-        )
+        zero_development = _evaluate_layer(source_text, student, index, development, world, device)
         _require_finite_metrics(zero_development, index, "zero-step development")
         if rank == 0:
             print(
@@ -394,47 +397,35 @@ def _layerwise(source_text, student, ids, output, rank, world, device, through_l
                 loss.backward()
                 _require_finite_tmix(tmix, index, f"epoch {epoch} backward", gradients=True)
                 torch.nn.utils.clip_grad_norm_(model_parameters, 1.0)
-                for parameter, master in zip(
-                    model_parameters, master_parameters, strict=True
-                ):
+                for parameter, master in zip(model_parameters, master_parameters, strict=True):
                     master.grad = (
                         None if parameter.grad is None else parameter.grad.detach().float()
                     )
                 optimizer.step()
                 with torch.no_grad():
-                    for parameter, master in zip(
-                        model_parameters, master_parameters, strict=True
-                    ):
+                    for parameter, master in zip(model_parameters, master_parameters, strict=True):
                         parameter.copy_(master.to(parameter.dtype))
                 _require_finite_tmix(tmix, index, f"epoch {epoch} update")
                 scheduler.step()
-                tmix.value_residual_scale.data.zero_()
+                if hasattr(tmix, "value_residual_scale"):
+                    tmix.value_residual_scale.data.zero_()
                 block_total += block_loss.detach() / len(loader)
                 mixer_total += mixer_loss.detach() / len(loader)
             train_block_nmse = _mean(block_total, world)
             train_mixer_nmse = _mean(mixer_total, world)
-            if not math.isfinite(train_block_nmse) or not math.isfinite(
-                train_mixer_nmse
-            ):
-                raise FloatingPointError(
-                    f"non-finite layer {index} epoch {epoch} train metrics"
-                )
+            if not math.isfinite(train_block_nmse) or not math.isfinite(train_mixer_nmse):
+                raise FloatingPointError(f"non-finite layer {index} epoch {epoch} train metrics")
             development_metrics = _evaluate_layer(
                 source_text, student, index, development, world, device
             )
-            _require_finite_metrics(
-                development_metrics, index, f"epoch {epoch} development"
-            )
-            previous_best_feasible = (
-                best_development["block_nmse"] <= BLOCK_NMSE_TARGET
-            )
+            _require_finite_metrics(development_metrics, index, f"epoch {epoch} development")
+            previous_best_feasible = best_development["block_nmse"] <= BLOCK_NMSE_TARGET
             previous_best_mixer = best_development["mixer_nmse"]
             improved = _development_is_better(development_metrics, best_development)
             if improved:
                 best_development = dict(development_metrics)
                 best_state = {
-                    name: value.detach().cpu().clone()
-                    for name, value in tmix.state_dict().items()
+                    name: value.detach().cpu().clone() for name, value in tmix.state_dict().items()
                 }
                 if development_metrics["block_nmse"] <= BLOCK_NMSE_TARGET:
                     if (
@@ -468,9 +459,7 @@ def _layerwise(source_text, student, ids, output, rank, world, device, through_l
                 break
         tmix.load_state_dict(best_state)
         _require_finite_tmix(tmix, index, "selected checkpoint")
-        training_metrics = _evaluate_layer(
-            source_text, student, index, training, world, device
-        )
+        training_metrics = _evaluate_layer(source_text, student, index, training, world, device)
         _require_finite_metrics(training_metrics, index, "selected optimizer-train")
         development_metrics = _evaluate_layer(
             source_text, student, index, development, world, device
@@ -482,9 +471,7 @@ def _layerwise(source_text, student, ids, output, rank, world, device, through_l
                 f"{development_metrics['block_nmse']:.8g} exceeds "
                 f"{BLOCK_NMSE_TARGET} after {max_epochs} epochs"
             )
-        final_metrics = _evaluate_layer(
-            source_text, student, index, frozen_final, world, device
-        )
+        final_metrics = _evaluate_layer(source_text, student, index, frozen_final, world, device)
         _require_finite_metrics(final_metrics, index, "frozen-final")
         if rank == 0:
             print(
@@ -500,13 +487,9 @@ def _layerwise(source_text, student, ids, output, rank, world, device, through_l
                     "selected_train_block_nmse": training_metrics["block_nmse"],
                     "selected_train_block_cosine": training_metrics["block_cosine"],
                     "selected_development_mixer_nmse": development_metrics["mixer_nmse"],
-                    "selected_development_mixer_cosine": development_metrics[
-                        "mixer_cosine"
-                    ],
+                    "selected_development_mixer_cosine": development_metrics["mixer_cosine"],
                     "selected_development_block_nmse": development_metrics["block_nmse"],
-                    "selected_development_block_cosine": development_metrics[
-                        "block_cosine"
-                    ],
+                    "selected_development_block_cosine": development_metrics["block_cosine"],
                     "initializer_metrics": metrics,
                     **final_metrics,
                 },
@@ -538,20 +521,25 @@ def _layerwise(source_text, student, ids, output, rank, world, device, through_l
 def _set_global_parameters(student):
     student.requires_grad_(False)
     ordinary, residual, scales = [], [], []
+    seen_gqa = False
     for index, layer in enumerate(student.model.layers):
         tmix = layer.tmix
         tmix.requires_grad_(True)
+        if student.config.source_layer_types[index] == "linear_attention":
+            ordinary.extend(tmix.parameters())
+            continue
         value_parameters = (tmix.v0, tmix.v1, tmix.v2)
-        if index:
+        if seen_gqa:
             residual.extend(value_parameters)
         scales.append(tmix.value_residual_scale)
-        if index == 0:
+        if not seen_gqa:
             for parameter in value_parameters:
                 parameter.requires_grad_(False)
             tmix.value_residual_scale.requires_grad_(False)
             tmix.value_residual_scale.data.zero_()
         excluded = {id(p) for p in (*value_parameters, tmix.value_residual_scale)}
         ordinary.extend(p for p in tmix.parameters() if id(p) not in excluded)
+        seen_gqa = True
     return ordinary, residual, [p for p in scales if p.requires_grad]
 
 
@@ -609,7 +597,12 @@ def _global_kl(
             scheduler.step()
             for scale in scales:
                 scale.data.clamp_(0, 1)
-            student.model.layers[0].tmix.value_residual_scale.data.zero_()
+            first_gqa = next(
+                layer.tmix
+                for index, layer in enumerate(student.model.layers)
+                if student.config.source_layer_types[index] == "full_attention"
+            )
+            first_gqa.value_residual_scale.data.zero_()
             total += loss_value / len(loader)
         average = _mean(total, world)
         history.append(average)
@@ -656,7 +649,11 @@ def _accept(output: Path) -> bool:
             )
         passed = passed and coherent
         records.append({"prompt": prompt, "token_ids": token_ids[0].tolist(), "output": answer})
-    scales = [float(layer.tmix.value_residual_scale) for layer in model.model.layers]
+    scales = [
+        float(layer.tmix.value_residual_scale)
+        for layer in model.model.layers
+        if hasattr(layer.tmix, "value_residual_scale")
+    ]
     result = {"passed": passed, "generations": records, "value_residual_scale": scales}
     (output / "acceptance.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -709,9 +706,7 @@ def convert_qwen3_5_2b(
     student = build_qwen2rwkv(source_outer, source_text).to(device=device, dtype=torch.bfloat16)
     local_ids = packed.input_ids[rank::world].contiguous()
     if not 0 <= through_layer < student.config.num_hidden_layers:
-        raise ValueError(
-            f"through_layer must be in [0, {student.config.num_hidden_layers - 1}]"
-        )
+        raise ValueError(f"through_layer must be in [0, {student.config.num_hidden_layers - 1}]")
     _layerwise(
         source_text,
         student,
@@ -774,9 +769,7 @@ def continue_global_kl(source: str, output: str) -> None:
         raise FileNotFoundError(f"missing packed sequences: {packed_path}")
     ids = torch.load(packed_path, map_location="cpu", weights_only=True)
     source_outer, source_text = load_qwen_teacher(source, torch.bfloat16, device)
-    student = Qwen2RWKVForCausalLM.from_pretrained(
-        output_path, dtype=torch.bfloat16
-    ).to(device)
+    student = Qwen2RWKVForCausalLM.from_pretrained(output_path, dtype=torch.bfloat16).to(device)
     tokenizer = AutoTokenizer.from_pretrained(source)
     _global_kl(
         source_outer,
