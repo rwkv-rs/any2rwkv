@@ -12,7 +12,12 @@ from transformers.cache_utils import Cache, CacheLayerMixin, LinearAttentionLaye
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5MLP, Qwen3_5RMSNorm
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5MLP,
+    Qwen3_5RMSNorm,
+    Qwen3_5TextRotaryEmbedding,
+    apply_rotary_pos_emb,
+)
 
 GDN = "linear_attention"
 GQA = "full_attention"
@@ -221,6 +226,9 @@ class Qwen2RWKVTimeMix(nn.Module):
         self.output = nn.Linear(channels, channels, bias=False)
         norm_heads = 16 if self.states_per_head == 1 else 8
         self.ln_x = nn.GroupNorm(norm_heads, channels, eps=config.group_norm_epsilon)
+        self.rotary_emb = (
+            Qwen3_5TextRotaryEmbedding(config) if self.states_per_head == 2 else None
+        )
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -266,12 +274,30 @@ class Qwen2RWKVTimeMix(nn.Module):
         base = base + self.value_residual_scale * gate * (v_first - base)
         return self.value_expand(base), v_first
 
-    def _pair_sum(self, raw, r, k, v):
-        n = raw.shape[0]
-        diag = (r * k * self.r_k).sum(-1, keepdim=True) * v
-        return (raw + diag).view(n, 8, 2, 256).sum(2).reshape(n, 2048)
+    def _pair_sum(self, value):
+        n = value.shape[0]
+        return value.view(n, 8, 2, 256).sum(2).reshape(n, 2048)
 
-    def _training_forward(self, x: torch.Tensor, v_first: torch.Tensor | None):
+    def _pair_diagonal(self, r, k, v):
+        diagonal = (r * k * self.r_k).sum(-1, keepdim=True) * v
+        return self._pair_sum(diagonal)
+
+    def _apply_gqa_rope(
+        self, r: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.rotary_emb is None:
+            return r, k
+        batch, length = position_ids.shape
+        r_heads = r.view(batch, length, self.kernel_heads, self.head_size).transpose(1, 2)
+        k_heads = k.view(batch, length, self.kernel_heads, self.head_size).transpose(1, 2)
+        cos, sin = self.rotary_emb(r, position_ids)
+        r_heads, k_heads = apply_rotary_pos_emb(r_heads, k_heads, cos, sin)
+        return (
+            r_heads.transpose(1, 2).reshape(batch, length, self.recurrent_width),
+            k_heads.transpose(1, 2).reshape(batch, length, self.recurrent_width),
+        )
+
+    def _training_components(self, x: torch.Tensor, v_first: torch.Tensor | None):
         flash = _flash("training", x)
         if x.dtype != torch.bfloat16 or x.shape[1] % 16:
             raise RuntimeError(
@@ -287,6 +313,10 @@ class Qwen2RWKVTimeMix(nn.Module):
         r = self.receptance(xr)
         decay = self.w0 + (torch.tanh(xw @ self.w1) @ self.w2)
         k = self.key(xk)
+        if self.states_per_head == 2:
+            positions = torch.arange(x.shape[1], device=x.device).view(1, -1)
+            positions = positions.expand(x.shape[0], -1)
+            r, k = self._apply_gqa_rope(r, k, positions)
         v, v_first = self._value(xv, v_first)
         a = flash.pretrain_tmix_a_gate_bf16(
             self.a0.reshape(-1).contiguous(), ((xa @ self.a1) @ self.a2).contiguous()
@@ -302,6 +332,10 @@ class Qwen2RWKVTimeMix(nn.Module):
         raw = flash.pretrain_recurrent_bf16(
             r.contiguous(), decay.contiguous(), k, v.contiguous(), aa, bb, head_size=self.head_size
         )
+        return flash, raw, r, k, v, g, v_first
+
+    def _training_forward(self, x: torch.Tensor, v_first: torch.Tensor | None):
+        flash, raw, r, k, v, g, v_first = self._training_components(x, v_first)
         if self.states_per_head == 1:
             mixed = flash.pretrain_tmix_lnx_rkvres_xg_bf16(
                 raw,
@@ -315,24 +349,25 @@ class Qwen2RWKVTimeMix(nn.Module):
                 head_size=128,
             )
         else:
-            mixed = self._pair_sum(
-                raw.reshape(-1, 16, 256),
-                r.reshape(-1, 16, 256),
-                k.reshape(-1, 16, 256),
-                v.reshape(-1, 16, 256),
-            ).view(x.shape[0], x.shape[1], 2048)
-            zeros = torch.zeros(8, 256, dtype=mixed.dtype, device=mixed.device)
+            raw_heads = raw.reshape(-1, 16, 256)
+            r_heads = r.reshape(-1, 16, 256)
+            k_heads = k.reshape(-1, 16, 256)
+            v_heads = v.reshape(-1, 16, 256)
+            pair_raw = self._pair_sum(raw_heads).view(x.shape[0], x.shape[1], 2048)
+            zeros = torch.zeros(8, 256, dtype=pair_raw.dtype, device=pair_raw.device)
             mixed = flash.pretrain_tmix_lnx_rkvres_xg_bf16(
-                mixed.contiguous(),
-                mixed.contiguous(),
-                mixed.contiguous(),
-                mixed.contiguous(),
+                pair_raw.contiguous(),
+                pair_raw.contiguous(),
+                pair_raw.contiguous(),
+                pair_raw.contiguous(),
                 zeros,
                 self.ln_x.weight.contiguous(),
                 self.ln_x.bias.contiguous(),
                 g,
                 head_size=256,
             )
+            pair_diagonal = self._pair_diagonal(r_heads, k_heads, v_heads).view_as(mixed)
+            mixed = mixed + pair_diagonal * g
         return self.output(mixed), v_first
 
     def _inference_forward(self, x: torch.Tensor, v_first, cache: Qwen2RWKVCache):
@@ -360,6 +395,11 @@ class Qwen2RWKVTimeMix(nn.Module):
         linear = flash.infer_tmix_linear_attention_c2c_forward_varlen
         r = linear(xr, self.receptance.weight.contiguous())
         k = linear(xk, self.key.weight.contiguous())
+        if self.states_per_head == 2:
+            positions = elapsed[:, None].to(torch.long) + torch.arange(t, device=x.device)
+            r, k = self._apply_gqa_rope(r.view(b, t, -1), k.view(b, t, -1), positions)
+            r = r.reshape(-1, self.recurrent_width).contiguous()
+            k = k.reshape(-1, self.recurrent_width).contiguous()
         base = linear(xv, self.value_base.weight.contiguous()).view(b, t, c)
         if self.layer_idx == 0:
             v_first = base
@@ -410,15 +450,17 @@ class Qwen2RWKVTimeMix(nn.Module):
                 max_seqlen=t,
             )
         else:
-            mixed = self._pair_sum(
-                raw.view(-1, 16, 256), r.view(-1, 16, 256), k.view(-1, 16, 256), v.view(-1, 16, 256)
-            )
+            raw_heads = raw.view(-1, 16, 256)
+            r_heads = r.view(-1, 16, 256)
+            k_heads = k.view(-1, 16, 256)
+            v_heads = v.view(-1, 16, 256)
+            pair_raw = self._pair_sum(raw_heads)
             zeros = torch.zeros(8, 256, dtype=x.dtype, device=x.device)
             mixed = flash.infer_tmix_lnx_rkvres_xg_forward_varlen(
-                mixed.contiguous(),
-                mixed.contiguous(),
-                mixed.contiguous(),
-                mixed.contiguous(),
+                pair_raw.contiguous(),
+                pair_raw.contiguous(),
+                pair_raw.contiguous(),
+                pair_raw.contiguous(),
                 zeros.reshape(-1).contiguous(),
                 self.ln_x.weight.contiguous(),
                 self.ln_x.bias.contiguous(),
@@ -427,6 +469,8 @@ class Qwen2RWKVTimeMix(nn.Module):
                 batch_size=b,
                 max_seqlen=t,
             )
+            pair_diagonal = self._pair_diagonal(r_heads, k_heads, v_heads)
+            mixed = mixed + pair_diagonal * g
         return linear(mixed, self.output.weight.contiguous()).view(b, t, c), v_first
 
     def forward(self, x, v_first=None, past_key_values=None, attention_mask=None):

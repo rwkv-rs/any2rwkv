@@ -43,6 +43,15 @@ def _config(source_config) -> Qwen2RWKVConfig:
 
 
 def _validate(config) -> None:
+    rotary_factor = config.rope_parameters.get("partial_rotary_factor", 1.0)
+    rotary_width = config.head_dim * rotary_factor
+    rotary_dim = int(rotary_width)
+    expected_prefix = (
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+    )
     if (
         config.num_hidden_layers != 24
         or config.hidden_size != 2048
@@ -52,9 +61,17 @@ def _validate(config) -> None:
         or config.linear_num_value_heads != 16
         or config.linear_key_head_dim != 128
         or config.linear_value_head_dim != 128
+        or config.linear_conv_kernel_dim != 4
         or config.num_attention_heads != 8
         or config.num_key_value_heads != 2
         or config.head_dim != 256
+        or config.hidden_act != "silu"
+        or config.attention_bias
+        or tuple(config.layer_types[:4]) != expected_prefix
+        or not float(rotary_width).is_integer()
+        or rotary_dim <= 0
+        or rotary_dim >= config.head_dim
+        or rotary_dim % 2
     ):
         raise ValueError("source must be the supported Qwen3.5-2B text geometry")
 
