@@ -1,450 +1,265 @@
-# 从 GQA 到 RWKV7：两个完整状态与一次对角修正
+# Qwen3.5 GQA 到有界 Hedgehog/RWKV7 的转换
 
-参考：
+## 1. 范围与唯一效果门槛
 
-- [将 Softmax Attention 线性化为 Gated DeltaNet](https://spaces.ac.cn/archives/11823)
-- [Sparse to Linear Attention](https://www.haoyizhu.site/blog/sparse-linear-attention/)
+Qwen3.5-2B 的前三层是 GDN，随后是第一个 full-attention GQA 层：
 
-本文只讨论 `full_attention` 的 GQA→RWKV7。Qwen3.5-2B 原模型的 Query head
-dimension 是 256，因此转换后模型也直接使用 kernel 支持的 256 维 head；每个原
-Query head 配两个完整的 \(256\times256\) 状态。GDN 保留原模型的完整外围结构，
-只把 recurrence 交给 D128 WKV，不属于本文的 GQA 数学改造范围。
+| layer | source mixer |
+| ---: | --- |
+| 0 | GDN |
+| 1 | GDN |
+| 2 | GDN |
+| 3 | GQA，8 个 query heads、2 个 KV heads、D256 |
 
-下文统一使用这些含义：
-
-- “原模型”指 Qwen GQA；“转换后模型”指 RWKV7 TMix；
-- “解析参考”指不受 kernel 参数范围约束的 FP32 公式；
-- “kernel 原生”指 FlashRWKV2 实际支持的参数范围与执行路径；
-- “初始化集”计算初始参数，“验证集”选择候选和最佳权重，“测试集”只做最终测量，
-  “训练集”只用于反向传播。
+layer 3 必须在已转换 layer 0–2 的 rank-local prefix cache 之后评估。
+`--through-layer 3` 仍为包含 layer 3 的边界；本轮在 layer 3 停止，不自动进入
+layer 4、global KL、generation 或全模型导出。
 
-我们的目标不是从随机 RWKV 开始模仿 Qwen，而是尽量把一个已经训练好的 GQA
-层直接“编译”为 RWKV7：先找到 Softmax Attention 的递推近似，再把递推式写成
-RWKV7 的状态更新，最后只对实际参数化留下的误差做闭式校正。这样得到的是第一步
-梯度更新之前的解析初始化；如果还需要蒸馏，也只需从一个相当接近的起点出发。
+效果层面的唯一硬指标是 unified validation 的完整 layer-3 Block NMSE：
 
-## 1. 先把 Softmax 写成递推式
-
-考虑一个 GQA group，它共享
-
-$$
-k_t,v_t\in\mathbb R^d,
-$$
-
-但服务于若干个不同的 Query heads。对任意查询 \(q\)，prefix attention 是
-
-$$
-o_t(q)=
-\frac{\sum_{i\leq t}\exp(q^\top k_i/\sqrt d)v_i}
-{\sum_{i\leq t}\exp(q^\top k_i/\sqrt d)}.
-\tag{1}
-$$
-
-记当前 token 的 Softmax 权重为
-
-$$
-p_t(q)=
-\frac{\exp(q^\top k_t/\sqrt d)}
-{\sum_{i\leq t}\exp(q^\top k_i/\sqrt d)},
-\tag{2}
-$$
-
-直接拆开分子、分母就有
-
-$$
-o_t(q)=(1-p_t(q))o_{t-1}(q)+p_t(q)v_t.
-\tag{3}
-$$
-
-式 \((3)\) 是精确恒等式。麻烦只在于 \(p_t(q)\) 仍然依赖查询，不能直接作为
-一个与未来查询无关的 RNN 状态。参考文章的关键启发，就是不要逐项拟合完整
-Attention 矩阵，而是把这个查询依赖展开成“均值 + 线性算子”。
-
-先做对称缩放
-
-$$
-q'_t=d^{-1/4}q_t,\qquad k'_t=d^{-1/4}k_t,
-\tag{4}
-$$
+\[
+  \operatorname{NMSE}_{Block,layer3}^{validation} \le 3\times10^{-3}.
+\]
 
-再定义 prefix 均值
-
-$$
-\bar k_t=\frac1t\sum_{i\leq t}k'_i,\qquad
-\bar v_t=\frac1t\sum_{i\leq t}v_i,
-\tag{5}
-$$
+attention、TMix、exact/cache mass、FP32/native 增量及吞吐均为诊断指标。
+FP32 reference 必须先达到 `1.5e-3`，再允许使用 BF16/FP16 的数值余量。
 
-以及中心化 Key 和 Value innovation
-
-$$
-\tilde k_t=k'_t-\bar k_t,\qquad
-\Delta v_t=v_t-\bar v_{t-1}.
-\tag{6}
-$$
+## 2. 已判废路线
 
-于是可以用一个矩阵 \(M_t\) 表示查询相关部分：
-
-$$
-\widehat o_t(q)=\bar v_t+M_tq'.
-\tag{7}
-$$
+PISA/PWT、bounded-hazard、exact-local-tangent 和 dual-expert 的可执行路径、
+配置与 checkpoint contract 已删除，不提供隐式迁移或 fallback。仅保留以下负结果：
 
-对应的 GDN 形式递推为
-
-$$
-\begin{aligned}
-M_t={}&(1-\rho_t)M_{t-1}
-+\rho_t\Delta v_t\tilde k_t^\top\\
-&-\lambda\rho_t
-(M_{t-1}\tilde k_t)\tilde k_t^\top,
-\qquad \rho_t=\frac1t.
-\end{aligned}
-\tag{8}
-$$
+| 判废路线 | 最佳相关结果 | 判废原因 |
+| --- | ---: | --- |
+| dual exact-local-tangent，4 个 D256 states/head | validation attention `0.20121`；完整 Block `0.11361` | oracle 已发生结构性失败，并非增加训练 epoch 可以解决 |
+| PISA/PWT，recent 256 + sink 8 | validation attention `0.00208100`；完整 Block `0.00158776` | 需要 264 个精确槽、528 KiB KV sidecar；只有 FP32 oracle，没有 native/runtime/BF16 证据；理论来源也不满足本轮顶会约束 |
 
-前三项分别是旧状态衰减、当前 Value-Key 写入和 rank-one erase；\(\lambda\)
-控制一阶展开之后的 closure。它不是 Softmax 恒等式的一部分，而是修正
-\(M_{t-1}\) 沿当前中心化 Key 方向过量延续的近似参数。当前初始化函数在
-初始化集上分别完整编译
-
-$$
-\lambda\in\{0,1/16,1/8,1/4,1/2,1\},
-$$
-
-然后只用验证集上的真实 RWKV7 TMix 输出 NMSE 选择有限候选。测试集不参与
-closure 选择。
-
-这里存在不能靠换参数消除的有限秩边界。指数点积核
-\(K(q,k)=\exp(q^\top k/\sqrt d)\) 在任意开集上有无限 feature rank，因为它的
-Taylor 展开包含所有阶的对称张量幂。对任意经验 kernel matrix \(K\)，任何 rank
-不超过 \(r=d+1=257\) 的近似 \(\widehat K\) 都满足 Eckart--Young 下界
-
-$$
-\frac{\|K-\widehat K\|_F^2}{\|K\|_F^2}
-\ge
-\frac{\sum_{j>257}\sigma_j(K)^2}{\sum_j\sigma_j(K)^2}.
-\tag{8a}
-$$
-
-实现报告的 `empirical_kernel_tail_ratio` 就是式 \((8a)\) 在截断初始化集或
-验证集 score matrix 上的谱尾。它是 relaxed kernel lower bound，不是完整
-TMix output lower bound：Softmax 归一化、Value 投影与 `o_proj` 都可能让 kernel
-误差落入输出不可见方向。
-
-反过来，若 \(|q^\top k/\sqrt d|\le R<1\)，一阶 Taylor feature
-\(1+q^\top k/\sqrt d\) 的逐项余项满足
-
-$$
-|e^s-(1+s)|\le \frac{e^R R^2}{2}.
-\tag{8b}
-$$
-
-若同时 \(\|v_i\|\le V\)，对这个正的一阶 kernel 做归一化后有一个保守输出上界
-
-$$
-\|o(q)-\widehat o(q)\|
-\le V e^{2R}R^2.
-\tag{8c}
-$$
-
-式 \((8c)\) 只证明小 score 区间中的一阶 kernel candidate 是二阶误差；当前
-centered affine recurrence 还带有在线均值、closure 与 native clamp，实际误差
-仍必须由 exact teacher trace 直接测量，不能把式 \((8c)\) 当作实现保证。
-
-## 2. 为什么正好需要两个完整的 \(256\times256\) 状态
-
-式 \((7)\) 有两项：一个完整线性算子 \(M_t\)，以及一个 256 维偏置
-\(\bar v_t\)。不妨取最后一个标准基
-
-$$
-e=(0,\ldots,0,1)^\top\in\mathbb R^{256},
-\tag{9}
-$$
-
-并定义
-
-$$
-S_t^{(0)}=M_t,\qquad
-S_t^{(1)}=\bar v_te^\top.
-\tag{10}
-$$
-
-两路 read 分别取
-
-$$
-r_t^{(0)}=q'_t,\qquad r_t^{(1)}=e,
-\tag{11}
-$$
-
-那么
-
-$$
-S_t^{(0)}r_t^{(0)}+S_t^{(1)}r_t^{(1)}
-=M_tq'_t+\bar v_t
-=\widehat o_t(q_t).
-\tag{12}
-$$
-
-这就是两个状态的分工：
-
-- 第一个状态保存完整的 \(256\times256\) 查询算子；
-- 第二个状态用最后一列保存 prefix Value mean；
-- 两个状态都完整保持原 Query head 的 256 维特征空间。
-
-Qwen3.5-2B 有 8 个 Query heads，所以转换后 `full_attention` 使用 16 个
-RWKV heads、`head_size=256`，也就是每个 Query head 对应一对状态。这里的
-“两个”来自 affine operator 的齐次化，而不是把一个矩阵按元素数量拆成两半。
-
-## 3. 把文章递推逐项编译到 RWKV7
-
-RWKV7 单个 head 的状态更新可以写成
-
-$$
-S_t
-=S_{t-1}\operatorname{Diag}(d_t)
--(S_{t-1}n_t)(n_t\odot a_t)^\top
-+u_t\kappa_t^\top,
-\tag{13}
-$$
-
-其中 \(n_t\) 是归一化 Key，第二项是 rank-one erase，第三项是 Value-Key
-写入。对矩阵状态 \(S^{(0)}\)，令
-
-$$
-\begin{aligned}
-d_t&=1-\rho_t,\\
-\kappa_t^{(0)}&=\rho_t^\gamma\tilde k_t,\\
-u_t^{(0)}&=\rho_t^{1-\gamma}\Delta v_t,\\
-n_t^{(0)}&=\tilde k_t/\|\tilde k_t\|_2,\\
-a_t^{(0)}&=
-\lambda\rho_t\|\tilde k_t\|_2^2\boldsymbol 1.
-\end{aligned}
-\tag{14}
-$$
-
-因为
-
-$$
-u_t^{(0)}{\kappa_t^{(0)}}^\top
-=\rho_t\Delta v_t\tilde k_t^\top,
-\tag{15}
-$$
-
-所以任意 \(\gamma\in[0,1]\) 都给出同一个 oracle outer product。但它们投影到
-真实 `key/value` 后并不等价，因此完整方案应在初始化集内按 TMix 输出
-选择 factorization gauge。当前实现先把中心化 Key 单位化，再把
-\(\rho_t\|\tilde k_t\|\) 放进 Value write；这是一个固定且数值稳定的 gauge，
-不是已经完成候选选择后的结论。
-
-对均值状态 \(S^{(1)}\)，取
-
-$$
-\kappa_t^{(1)}=\rho_t e,\qquad
-u_t^{(1)}=v_t,\qquad
-r_t^{(1)}=e,
-\tag{16}
-$$
-
-就得到标准 prefix mean 更新。RWKV7 的 decay 链接为
-
-$$
-d=\exp\left[-e^{-1/2}\sigma(w)\right],
-\tag{17}
-$$
-
-其最小值约为 \(0.5452\)，而 \(t=1\) 请求的 decay 是 0。第二个状态只占最后一列，
-所以可以在 \(e\) 方向增加 erase correction，抵消 mean state 的
-`realized_decay - requested_decay`。这个修正不同时解决 matrix state 的各向同性
-decay floor；matrix state 仍需裁剪并把该误差计入 native diagnostic。因此，式
-\((8)\) 到无限制 DPLR oracle 可以逐项编译，但到 clamp-w native RWKV7 不是机器
-精度无损映射。
-
-## 4. 两个状态必须先求和，再过转换后模型的输出边界
-
-设两路状态读出为 \(z^{(0)},z^{(1)}\)，原 GQA 的输出边界是
-
-$$
-y=W_o\left[g\odot(z^{(0)}+z^{(1)})\right].
-\tag{18}
-$$
-
-因此不能对两路状态分别做 GroupNorm；那会破坏式 \((12)\) 的 affine 和。实际
-module 按 `[query_head, state, channel]` 保存 interleaved states，先计算
-
-$$
-z_h=z_h^{(0)}+z_h^{(1)},
-\tag{19}
-$$
-
-然后只对 8 个 D256 Query-head outputs 做一次逐 token GroupNorm。两路 state 的
-current-token residual 也先按 Query head 求和，但它位于 GroupNorm 之后、gate
-之前。因此转换后模型的真实边界是
-
-$$
-\widehat y
-=\widehat W_o\left[
-\widehat g\odot\left(
-\operatorname{GN}_8(z)+\delta z_{r_k}
-\right)
-\right].
-\tag{19a}
-$$
-
-不能把 `r_k` 提前送入 GroupNorm，也不能让两个 states 分别归一化。式 \((19a)\)
-还明确暴露了原模型无 GroupNorm、转换后模型有 GroupNorm 的结构差异；最后的 gate、
-`r_k` 和 `output` 拟合负责在观测数据上尽量吸收它，而不是宣称边界代数无损。
-
-这个 pair-sum 约定同时解决训练和推理的一致性：checkpoint 中仍然是标准
-RWKV7 tensor，kernel 仍然处理 16 个独立的 \(256\times256\) states；转换后 module
-module 在逐 token GroupNorm 之前把每对状态还原成一个 Query head 的读出。
-
-## 5. 从动态 oracle 到静态权重
-
-前面得到的是逐 token 的 \(r,w,k,v,a,g\) 目标，checkpoint 需要的是固定权重。
-对 bias-free projection，统一求解
-
-$$
-W^*=
-\arg\min_W
-\|XW^\top-Y\|_F^2
-+\lambda\|W-W_0\|_F^2.
-\tag{20}
-$$
-
-`receptance` 和 `key` 的 oracle 是在 partial RoPE 之后定义的，所以初始化函数
-先对 matrix-state read/key 施加逆 RoPE，在 pre-RoPE 空间求式 \((20)\)。转换后模型的
-training forward 使用序列内位置，inference forward 使用 cache 中每条序列的
-`elapsed`，再对两个 interleaved states 同时施加真实 Qwen3.5 partial RoPE。
-mean-state 的 DC read/key 放在不参与旋转的最后一个坐标。这样训练、prefill 和
-逐 token decode 使用同一位置语义；不允许靠固定初始化集的位置相关性让静态
-projection 隐式记住 RoPE。构建器同时校验 `0 < rotary_dim < head_dim` 且
-`rotary_dim` 为偶数；full-RoPE checkpoint 没有可用 DC 尾部，必须 fail closed，
-不能套用这条双状态布局。
-
-`receptance`、`key` 和 expanded `value` 使用初始化集上固定正则的
-time-mix/ridge 解；每个 closure 都从完整 TMix snapshot 重新拟合，不跨候选复用
-projection。`output` 才使用原模型 `o_proj` 作为 relative-ridge prior，并在真实
-native recurrence 产生的 pre-output 上重新求解。
-
-GroupNorm affine 也不是固定为 1/0。实现先从真实 native recurrence 捕获 pair-sum
-raw read，对每个 Query head/channel 闭式拟合 `ln_x.weight/bias`，使其逼近 exact
-attention head output；初始化集与验证集 residual 分开报告。这个拟合
-只能吸收当前轨迹上可见的 affine 差异，不能消除 GroupNorm 的 DC null direction。
-
-其余分支按真实 RWKV7 参数化拟合：
-
-- `w_lora`：反解式 \((17)\) 后拟合 `down → tanh → up+bias`；
-- `a_lora`：对 erase logit 拟合 `down → up+bias`；
-- `g_lora`：保持 `down → sigmoid → up`，并复制原模型 gate 的 head 对应关系；
-- `output`：在完整 free-running recurrence、pair-sum、单次 GroupNorm、gate 和
-  `r_k` 之后的真实 pre-output 上求解。
-
-初始化函数同时报告三个互不替代的 trajectory 指标：
-
-- `reference_init_source_trace_output_nmse`：FP32 exact Softmax reference 经过原模型
-  gate/`o_proj` 后，相对真实原模型 attention forward 的数值差异；
-- `reference_affine_attention_init_nmse` 与对应的 `validation` 指标：式 \((8)\)
-  的 affine recurrence 相对 exact causal Softmax teacher trace 的误差；
-- `initialized_native_clamp_delta_init_nmse` 与对应的 `validation` 指标：把同一
-  recurrence 的 decay/erase/write 放进
-  clamp-w native 可达域后，相对 affine recurrence 新增的误差，并以 exact
-  attention energy 归一化；
-- `reference_init_empirical_kernel_tail_ratio` 与对应的 `validation` 指标：式
-  \((8a)\) 的 rank-257 relaxed kernel 谱尾。
-
-前者衡量 Softmax 有限状态近似，后者衡量 native 参数域；静态 projection 和
-GroupNorm/output fitting 的误差则继续由真实 RWKV7 TMix 输出 NMSE 衡量。任何一个
-内部指标接近零，都不能代替 TMix 输出或整层输出验收。
-
-闭式 signal fit 只使用初始化集。最终边界以原模型 `o_proj` 为 prior，交替拟合
-`output` 与 `r_k`；在验证集上分别记录 prior、candidate 和实际安装后的 TMix 输出
-NMSE，只有 candidate 有限且严格改善才原子安装，否则恢复完整 TMix snapshot。
-测试集不参与任何拟合、方法选择或重试。
-
-## 6. 用 `r_k` 补当前 token 的对角余项
-
-即使 \(r,k,v,w,a,g,W_o\) 全部固定，标准 RWKV7 还保留一个很有用的现成参数
-`r_k`。它贡献的当前 token 项为
-
-$$
-\delta z_{t,h}
-=
-\left[
-\sum_j r_{t,h,j}k_{t,h,j}(r_k)_{h,j}
-\right]v_{t,h}.
-\tag{21}
-$$
-
-这个项正好对应“当前 token 的 Key-Value 写入尚未来得及经过长期状态传播”的
-对角修正。更重要的是，在其他参数固定时，完整 mixer 输出对 \(r_k\) 是严格
-线性的。于是可以直接求
-
-$$
-\min_\eta
-\|Y_{\text{base}}+\mathcal A\eta-Y_{\text{Qwen}}\|_2^2
-+\lambda\|\eta\|_2^2,
-\qquad \eta=r_k.
-\tag{22}
-$$
-
-当前实现不显式构造巨大设计矩阵，而用真实 gate、pair-sum 和 `output` 定义
-\(\mathcal A\) 及其转置，再以 matrix-free conjugate gradient 求解。固定 gate
-和 `output` 时，式 \((22)\) 对 `r_k` 严格线性；一旦 `output` 也同时未知，两者的
-乘积使问题变成双线性，不能谎称为一次联合线性回归。因此实现先闭式 ridge
-`output`，再固定它求 `r_k`，随后重新解 `output`，最多交替四轮。
-
-整个交替候选只按验证集结果原子安装。测试集只在候选和 checkpoint 固定后评估；
-本文说明当前算法与实现边界，不把静态检查、CPU reference、GPU kernel 验证和
-完整逐层验收混为同一种证据。
-
-## 7. 当前逐层对齐边界
-
-当前训练入口解冻本层完整标准 RWKV7 TMix。原模型、Cmix/MLP、decoder Norm、
-embedding、其它层和 value-residual 保持冻结；训练集只用于更新参数，验证集负责
-选择最佳 checkpoint，测试集只在权重固定后评估一次。
-
-每张卡的 rows `0:8`/`8:16`/`16:24`/`24:` 分别固定为初始化集、验证集、测试集和
-训练集。本阶段以 `--through-layer 3` 测到第一层 GQA；验证集与测试集的整层输出
-NMSE 都必须不高于 $10^{-3}$，TMix 输出 NMSE 单独优化和报告，但不单独阻断。
-
-某层未达到严格目标时，本次进程仍在内存中测完 `--through-layer` 指定的层，最后
-整体返回失败。从第一个未通过层开始不保存正式 `layer_XX.safetensors`；后续层结果
-只用于观察未通过前缀的误差传播，不构成正式验收。测试集结果不得用于调整参数或
-重试方法。
-
-当前初始化函数、转换后 module 和训练入口分别位于
-[`src/any2rwkv/qwen2rwkv/gqa2rwkv.py`](../src/any2rwkv/qwen2rwkv/gqa2rwkv.py)、
-[`src/any2rwkv/qwen2rwkv/transformers/modeling_qwen2rwkv.py`](../src/any2rwkv/qwen2rwkv/transformers/modeling_qwen2rwkv.py)
-和 [`src/any2rwkv/qwen2rwkv/align/train.py`](../src/any2rwkv/qwen2rwkv/align/train.py)。
-
-## 8. 一条完整而可复现的迁移顺序
-
-将上述推导压缩起来，GQA→RWKV7 的初始化顺序是：
-
-1. 从真实 Qwen 层回放 post-RoPE Q/K、V、原模型 gate 和 TMix 输出。
-2. 按式 \((4)\) 至式 \((8)\) 构造 prefix mean 与完整 affine operator，
-   在初始化集上拟合候选，并用验证集选择 closure \(\lambda\)。
-3. 为每个原 Query head 建立两个完整 \(256\times256\) states，分别保存
-   \(M_t\) 与 \(\bar v_te^\top\)。
-4. 按式 \((14)\) 至式 \((17)\) 把两路状态递推编译为 RWKV7
-   decay/erase/write；matrix state 使用单位化 centered Key，并把相应尺度放入
-   Value write。
-5. 在 pre-RoPE 空间闭式拟合 read/key；按真实 nonlinear/low-rank contract
-   拟合 decay、erase、write 和 sigmoid gate。
-6. 先 pair-sum 两路 raw read，再对 8 个 Query heads 做一次 GroupNorm；把两路
-   raw read 对 exact attention 拟合一次 GroupNorm affine，再把两路 `r_k`
-   residual pair-sum 后加在 GroupNorm 之后、gate 之前。
-7. 交替求解 `output` ridge 与 matrix-free `r_k` CG，最多四轮；只在验证集
-   TMix 输出 NMSE 有限且严格改善时安装完整边界候选。
-8. 把 tensor 物化进真实 head-size-256 module，以 BF16 kernel 在独立
-   验证集和测试集上验收；需要进一步对齐时，只解冻当前标准 TMix，
-   再进入逐层蒸馏。
-
-这条路线的要点其实很简单：先给 affine operator 足够的完整状态容量，再利用
-RWKV7 已有的 rank-one transition 表达两路递推，并明确记录 decay floor、
-Softmax→affine recurrence、静态 signal projection 和 native normalization 各自
-留下的误差，而不会再把两状态 layout 错误混入结果。
-
-本文只描述当前算法与实现合同。静态检查、reference probe、GPU kernel 检查和
-layer 0–3 逐层结果必须分别报告，不能互相替代。
+这些值只是历史诊断，不对应当前受支持的 artifact。当前固定方案失败时不得重新启用
+上述路线。
+
+## 3. 研究依据
+
+当前实现是固定的工程组合，不是架构网格搜索或逐篇大规模复现：
+
+- [Hedgehog，ICLR 2024](https://proceedings.iclr.cc/paper_files/paper/2024/file/ebba182cb97864368fdb6ae00773a5e4-Paper-Conference.pdf)：可学习正值特征映射；
+- [LoLCATs，ICLR 2025](https://proceedings.iclr.cc/paper_files/paper/2025/file/72163d1c3c1726f1c29157d06e9e93c1-Paper-Conference.pdf)：attention transfer 后接 low-rank correction，以及 exact-window 与 linear-tail 共享分母；
+- [LoLCATs 官方实现](https://github.com/HazyResearch/lolcats/blob/main/src/model/linear_attention/linear_window_attention_tk_gen.py)：共享归一化的实际计算顺序；
+- [BASED，ICML 2024](https://proceedings.mlr.press/v235/arora24a.html)：局部精确注意力和长程线性状态的互补结构；
+- [StreamingLLM，ICLR 2024](https://proceedings.iclr.cc/paper_files/paper/2024/hash/5e5fd18f863cbe6d8ae392a93fd271c9-Abstract-Conference.html)：永久保留初始 attention sink；
+- [H2O，NeurIPS 2023](https://proceedings.neurips.cc/paper_files/paper/2023/hash/6ceefa7b15572587b78ecfcebb2827f8-Abstract.html)：recent 与累计重要度 heavy hitter；
+- [Transformers are RNNs，ICML 2020](https://proceedings.mlr.press/v119/katharopoulos20a.html)：加法线性注意力状态。
+
+本轮不测试 Performer、Taylor、T2R、其他容量或随机种子。
+
+## 4. 固定目标架构
+
+### 4.1 精确 sidecar 分区
+
+每条序列、每个被转换 GQA 层最多持有 128 个 token 槽：
+
+- `0:8`：最初 8 个 sink token；
+- `8:72`：64-token recent ring；
+- `72:128`：56 个 H2O heavy hitters。
+
+每个 token 必须且只能位于 exact sidecar 或 linear tail 之一。recent 溢出时，
+最旧 recent token 与最低累计分的 heavy token 比较；同分时按原始 position 稳定
+排序，淘汰更老的非 sink token。被淘汰 token 在当前 query 读取之前写入 tail。
+
+heavy score 是 hybrid 最终归一化 exact probability 在 8 个 query heads 上的均值
+累加。slot 决策和 score 更新均与反向传播分离；两个 KV heads 共用同一套 token
+位置。
+
+2 个 KV heads、D256 下，FP16/BF16 K+V payload 为：
+
+\[
+  128 \times 2 \times 256 \times 2 \times 2
+  =262144\text{ bytes}=256\text{ KiB}.
+\]
+
+FP32 score、INT32 original position、固定槽类别和 elapsed cursor 单独报告，
+不计入“256 KiB KV payload”。当前固定布局由 slot range 推导类别和 valid 状态，
+不额外保存随上下文增长的索引结构。
+
+### 4.2 Hedgehog linear tail
+
+每个 query head 独立使用：
+
+\[
+ \phi(x)=
+ [\operatorname{softmax}(xW),\operatorname{softmax}(-xW)].
+\]
+
+原始 head dimension 为 256，projection dimension 为 64，正值 feature dimension
+为 128；进入 RWKV state 前补零到 D256。Q/K feature map 分别持有每-head 投影。
+
+LoLCATs 配置中的 `zero_init` 不能解释成“把权重全部置零”。其官方
+`FeatureMapMLP.zero_init_()` 在无 skip connection 时实际执行 `eye_`；因此本实现
+把每个 `256×64` Q/K 投影初始化为截断单位阵。若使用全零矩阵，成对 softmax
+映射会落入对称驻点，初始 `W_q/W_k` 梯度为零。
+
+每个 query head 使用两个 D256 RWKV7 states：
+
+1. numerator state：累计 `value ⊗ phi_k`；
+2. denominator state：以全 1 value 累计 `1 ⊗ phi_k`，readout 后对 256 个 value coordinates 取均值。
+
+8 个 query heads 共 16 个 D256 states，FP16 recurrent state 为 2 MiB/layer。
+与 exact sidecar 合计约 2.25 MiB/sequence/layer，且不随上下文长度增长。原始
+2-KV-head GQA 约消耗 2 KiB/token，固定实现的 cache 收支平衡点约为 1153
+tokens；短上下文不宣称节省显存。
+
+仅被淘汰 token 写入 tail。FlashRWKV2 固定接收 `decay_logits=-30`、`a=b=0`；
+decay/erase 不训练。所有矩阵状态更新只调用 FlashRWKV2 公共 recurrent operator，
+没有 Torch、FLA 或 local-kernel 产品 fallback。
+
+### 4.3 共享分母 readout
+
+当前 exact slots 为 \(E_t\) 时：
+
+\[
+ A_E=\exp(qK_E^\top/\sqrt{256}-m).
+\]
+
+linear tail 为：
+
+\[
+ N_L=S_L\phi(q),\qquad D_L=z_L^\top\phi(q).
+\]
+
+每个 query head 训练一个
+\(\beta_h=\sigma(b_h)\)，初始值为 0.1，并令
+\(\alpha_h=1-\beta_h\)：
+
+\[
+ o_t=
+ \frac{\beta_h A_EV_E+\alpha_hN_L}
+      {\beta_h\sum A_E+\alpha_hD_L+\epsilon}.
+\]
+
+source Q/K/V、q/k RMSNorm、partial RoPE、sigmoid gate、`o_proj`、residual 与
+Cmix 保持兼容。sidecar 保存原始绝对位置上完成 partial RoPE 的 K，不做位置
+重编号。
+
+当 prefix 长度不超过 128 时，tail 为空，exact 分支必须与 source causal Softmax
+一致且不依赖 beta。实现会 fail closed 检查 denominator 有限且严格为正、position
+无重复、容量不溢出、每个 prefix token 不丢失且不重复计数。
+
+## 5. Config 与 checkpoint contract
+
+唯一受支持的 GQA 配置为：
+
+| field | value |
+| --- | --- |
+| `gqa_feature_projection_dim` | 64 |
+| `gqa_feature_output_dim` | 128 |
+| `gqa_states_per_query_head` | 2 |
+| `gqa_sidecar_capacity` | 128 |
+| `gqa_sink_slots` | 8 |
+| `gqa_recent_slots` | 64 |
+| `gqa_heavy_slots` | 56 |
+| `gqa_readout_mode` | `hedgehog_h2o_shared_norm` |
+| `gqa_checkpoint_schema` | `gqa_hedgehog_h2o_d256x2_v1` |
+
+未修改的 source-model builder 仍会在进程内传入旧 expert/router 构造参数；它们
+只是 builder compatibility input，`Qwen2RWKVConfig.to_dict()` 会删除它们，因而
+不会进入新 config 或 checkpoint contract。持久化 artifact 缺少上表任一字段时
+直接拒绝加载；旧 dual/PWT state 也会因 strict `state_dict` 不匹配而失败，并提示
+使用 fresh output directory。
+
+## 6. 数据与两阶段训练
+
+每个 rank 固定划分：
+
+- rows `0:8`：initializer 与 exact-prefix preflight；
+- rows `8:24`：唯一 unified validation；
+- rows `24:`：optimizer training。
+
+prefix-cache 模式只接受 SHA-256 为
+`1d039b73dcafd9783a7e872f682cf64728cb31f6090ef54c2882ca3bc0919336`
+的 immutable `packed_sequences.pt`。序列长度为 512，batch size 为 8/rank，
+顺序固定，seed 为 0；不执行 feature/window/capacity/seed 组合搜索。
+
+### Phase A：Attention Transfer
+
+只训练 Hedgehog Q/K feature weights 和 8 个 `beta_logit`：
+
+\[
+ L_A=\operatorname{NMSE}(o_{hybrid}^{heads},o_{source}^{heads}).
+\]
+
+- AdamW，LR `1e-2`，betas `(0.9,0.99)`，weight decay 0；
+- gradient clip 1；
+- 5% warmup + cosine decay；
+- 最多 16 epochs；
+- validation 完整 Block NMSE 连续 4 epochs 没有降低即停止。
+
+### Phase B：Low-rank Block Correction
+
+冻结 feature maps、beta、sidecar policy 和 recurrence。在 Q/K/V/O 上训练
+rank-16、alpha-32、dropout-0 LoRA。Qwen 合并 Q/gate projection 中只有每个
+head 的 Q slice 接收 LoRA，sigmoid gate slice 保持 source 权重不变。
+
+\[
+ L_B=4\,\operatorname{NMSE}(Block_s,Block_t)
+     +\operatorname{NMSE}(TMix_s,TMix_t).
+\]
+
+- AdamW，LR `3e-5`，betas `(0.9,0.99)`，weight decay 0.1；
+- gradient clip 1；
+- 5% warmup + cosine decay；
+- 最多 48 epochs；
+- validation 完整 Block NMSE 连续 8 epochs 没有降低即停止。
+
+两个阶段都只按 unified-validation 完整 Block NMSE 选择最佳 checkpoint；
+TMix/attention 不能覆盖 Block 排序。LoRA 在保存前合并回 Q/K/V/O，runtime 不
+保留 adapter 分支。本 GQA 路径没有额外 96-epoch corrective phase。
+
+## 7. Fail-closed 证据阶梯
+
+layer-3 artifact 只有依次通过下列门槛后才会保存：
+
+1. **Static/reference**
+   - 每个 token 恰好属于 exact sidecar 或 tail；
+   - sink/recent/heavy 不超过 8/64/56；
+   - 第一次 eviction 恰好发生在 token index 128；
+   - denominator 有限且严格为正；
+   - `T<=128` 的 head、TMix 和完整 Block NMSE 均不超过 `1e-6`。
+2. **FP32 reference effect**
+   - unified-validation 完整 Block NMSE 不超过 `1.5e-3`。
+3. **FlashRWKV2 BF16**
+   - unified-validation 完整 Block NMSE 不超过 `3e-3`；
+   - 相对 FP32 reference 的完整 Block 增量 NMSE 不超过 `1e-3`。
+4. **FP16 inference/cache**
+   - 子进程 fresh strict-load 新 config/schema 和已合并 state；
+   - full prefill、64/128/256-token chunked prefill 与 T=1 decode 的完整 Block
+     输出相对 full prefill NMSE 均不超过 `1e-3`；
+   - `batch_repeat_interleave`、`batch_select_indices`、reset 后继续运行与基线
+     NMSE 不超过 `1e-3`；
+   - 512、4096、8192-token soak 中 exact slots 永远不超过 128，sidecar K/V
+     固定为 256 KiB，recurrent state 固定为 2 MiB，elapsed 与 token count 一致，
+     且没有 NaN/Inf 或随序列增长的持久 tensor/list/cache。
+
+任一门槛失败都会恢复训练前 source-shell snapshot、不保存 layer artifact，并输出
+最佳 validation Block/TMix、失败证据层和 sidecar mass 诊断。不会扩大容量、换
+seed、加入专家或切回非顶会方案。
+
+## 8. 当前证据与尚未完成的证据
+
+当前本机 `.venv` 的 CPU/reference 临时 probe 已证明：
+
+- 新 schema 可 round-trip，旧 GQA config 会 fail closed；
+- 16-token exact-prefix attention NMSE 为 `6.129229085670472e-15`，完整 TMix
+  NMSE 为 `3.100761292694487e-14`；
+- 201-token policy probe 中 exact/tail 无重复、无丢失，最终分类数为
+  sink/recent/heavy=`8/64/56`，第一次 tail eviction 是 position 8；
+- LoLCATs 截断单位阵初始化在 129-token overflow 后对 `W_q`、`W_k`、beta 都
+  产生有限非零梯度；
+- 模拟公共 recurrent provider 的 D256×2 numerator/denominator 相对显式 tail
+  和式 NMSE 分别约为 `3.17e-6` 与 `3.00e-6`；
+- 模拟 provider 下整段 prefill 与逐 token decode NMSE 为 `0.0`；
+- cache repeat/select/reset 与 fresh-process strict load 均通过；
+- rank-16 LoRA merge 只产生浮点舍入量级差异，merge 后 state 中没有 LoRA tensor。
+
+这些只属于 static/CPU/reference 证据，不能证明目标 GPU 上的 FlashRWKV2 BF16
+正确性、FP16 prefill/decode parity、8192-token soak 或最终 layer-3 `3e-3` 效果门。
+上述 GPU gate 已接入训练控制流，但必须等待经授权的 8×PRO6000 运行后才能填写
+实测值。本轮没有 commit、push、远端同步、GPU 运行或 layer-3 artifact。
