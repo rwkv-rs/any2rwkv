@@ -184,7 +184,8 @@ def fit_groupnorm_affine(
         return math.inf
     target.ln_x.weight.copy_(weight.reshape(-1).to(target.ln_x.weight))
     target.ln_x.bias.copy_(bias.reshape(-1).to(target.ln_x.bias))
-    return _nmse(_apply_groupnorm_affine(target, raw), wanted)
+    fitted = _apply_groupnorm_affine(target, raw).reshape_as(wanted)
+    return _nmse(fitted, wanted)
 
 
 def _capture_native_input(target, hidden: torch.Tensor) -> torch.Tensor:
