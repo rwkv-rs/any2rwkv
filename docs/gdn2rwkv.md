@@ -138,6 +138,18 @@ $$
 w=\operatorname{logit}(\widehat u).
 $$
 
+令
+
+$$
+\widehat\ell=-e^{-1/2}\widehat u,
+\qquad \widehat d=\exp(\widehat\ell).
+$$
+
+runtime 对同一个 realized decay 一致地生成 `w` 和
+$b_t^{\rm wkv}=-\beta_t\widehat d_tk_t$。因此域内
+$\widehat d_t=d_t$ 时仍是上面的精确映射；域外则把完整 decay/erase 转移项投影到
+Clamp-W 可达边界，而不是只投影各向同性 decay。
+
 forward 始终使用投影后的值。训练时 clamp 使用 straight-through estimator：
 
 ```python

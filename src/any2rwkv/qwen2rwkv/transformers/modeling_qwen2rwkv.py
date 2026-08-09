@@ -312,12 +312,13 @@ class Qwen2RWKVGatedDeltaNet(Qwen3_5GatedDeltaNet):
         return query, key, value, beta, log_decay, z
 
     def _wkv_inputs(self, query, key, value, beta, log_decay, *, training: bool):
-        retention = log_decay.exp()
         read = query / math.sqrt(self.head_k_dim)
         write = beta[..., None] * value
+        decay_logits = _clamp_w_logits(log_decay, straight_through=training)
+        realized_log_decay = W_SCALE * decay_logits.sigmoid()
+        retention = realized_log_decay.exp()
         erase = -(beta.float() * retention)[..., None] * key.float()
-        decay = _clamp_w_logits(log_decay, straight_through=training)[..., None]
-        decay = decay.expand_as(key)
+        decay = decay_logits[..., None].expand_as(key)
         dtype = value.dtype
         return tuple(
             tensor.flatten(2).to(dtype).contiguous()

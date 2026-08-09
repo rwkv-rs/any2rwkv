@@ -99,7 +99,8 @@ def _gdn_trace(source, hidden: torch.Tensor) -> dict[str, torch.Tensor]:
 
     clamp_ratio = (log_decay / W_SCALE).clamp(CLAMP_W_EPSILON, 1 - CLAMP_W_EPSILON)
     realized_log_decay = W_SCALE * clamp_ratio
-    clamped_raw = _rwkv_trace(read, key, write, erase, realized_log_decay)
+    realized_erase = beta * realized_log_decay.exp()
+    clamped_raw = _rwkv_trace(read, key, write, realized_erase, realized_log_decay)
     clamped_pre_output = source.norm(
         clamped_raw.reshape(-1, source.head_v_dim).to(captured["raw"]),
         captured["gate"].reshape(-1, source.head_v_dim),
