@@ -31,8 +31,8 @@ PROMPTS = (
     "Solve x^2 - 5x + 6 = 0 and explain briefly.",
     "Write a Python function that returns the Fibonacci sequence up to n.",
 )
-BLOCK_NMSE_TARGET = 1e-3
-FEASIBLE_MIXER_PATIENCE = 5
+LAYER_OUTPUT_NMSE_TARGET = 1e-3
+VALIDATION_TMIX_PATIENCE = 5
 
 
 def _distributed():
@@ -74,7 +74,7 @@ def _teacher_layer(source_text, layer_idx, hidden):
     )
 
 
-def _teacher_mixer(source_text, layer_idx, hidden):
+def _teacher_tmix_output(source_text, layer_idx, hidden):
     layer = source_text.layers[layer_idx]
     normalized = layer.input_layernorm(hidden)
     mask = torch.ones(hidden.shape[:2], dtype=torch.bool, device=hidden.device)
@@ -89,7 +89,7 @@ def _teacher_mixer(source_text, layer_idx, hidden):
     )[0]
 
 
-def _student_mixer(student, layer_idx, hidden):
+def _student_tmix_output(student, layer_idx, hidden):
     layer = student.model.layers[layer_idx]
     normalized = layer.input_layernorm(hidden)
     return layer.tmix(
@@ -116,25 +116,25 @@ def _require_finite_tmix(tmix, layer_idx: int, stage: str, *, gradients: bool = 
             raise FloatingPointError(f"non-finite layer {layer_idx} {kind} {name} during {stage}")
 
 
-def _initialize_layer(source_text, student, layer_idx, hidden, selection_hidden):
+def _initialize_layer(source_text, student, layer_idx, init_hidden, validation_hidden):
     source_layer = source_text.layers[layer_idx]
     target = student.model.layers[layer_idx].tmix
-    normalized = source_layer.input_layernorm(hidden)
-    selection_normalized = source_layer.input_layernorm(selection_hidden)
+    init_normalized = source_layer.input_layernorm(init_hidden)
+    validation_normalized = source_layer.input_layernorm(validation_hidden)
     if source_text.config.layer_types[layer_idx] == "linear_attention":
         metrics = initialize_gdn_layer(
-            source_layer.linear_attn, target, normalized, selection_normalized
+            source_layer.linear_attn, target, init_normalized, validation_normalized
         )
     else:
-        _, embeddings = _position(source_text, normalized)
-        _, selection_embeddings = _position(source_text, selection_normalized)
+        _, init_embeddings = _position(source_text, init_normalized)
+        _, validation_embeddings = _position(source_text, validation_normalized)
         metrics = initialize_gqa_layer(
             source_layer.self_attn,
             target,
-            normalized,
-            embeddings,
-            selection_normalized,
-            selection_embeddings,
+            init_normalized,
+            init_embeddings,
+            validation_normalized,
+            validation_embeddings,
         )
         _freeze_value_residual(target)
     return metrics
@@ -159,7 +159,7 @@ def _mean(value: torch.Tensor, world: int):
     return float(value)
 
 
-def _gather_calibration(hidden: torch.Tensor, world: int) -> torch.Tensor:
+def _gather_init_hidden(hidden: torch.Tensor, world: int) -> torch.Tensor:
     if world == 1:
         return hidden
     gathered = [torch.empty_like(hidden) for _ in range(world)]
@@ -167,19 +167,19 @@ def _gather_calibration(hidden: torch.Tensor, world: int) -> torch.Tensor:
     return torch.cat(gathered)
 
 
-def _development_is_better(candidate: dict[str, float], best: dict[str, float]) -> bool:
-    candidate_feasible = candidate["block_nmse"] <= BLOCK_NMSE_TARGET
-    best_feasible = best["block_nmse"] <= BLOCK_NMSE_TARGET
-    if candidate_feasible != best_feasible:
-        return candidate_feasible
-    if candidate_feasible:
-        return (candidate["mixer_nmse"], candidate["block_nmse"]) < (
-            best["mixer_nmse"],
-            best["block_nmse"],
+def _validation_is_better(candidate: dict[str, float], best: dict[str, float]) -> bool:
+    candidate_passed = candidate["layer_output_nmse"] <= LAYER_OUTPUT_NMSE_TARGET
+    best_passed = best["layer_output_nmse"] <= LAYER_OUTPUT_NMSE_TARGET
+    if candidate_passed != best_passed:
+        return candidate_passed
+    if candidate_passed:
+        return (candidate["tmix_output_nmse"], candidate["layer_output_nmse"]) < (
+            best["tmix_output_nmse"],
+            best["layer_output_nmse"],
         )
-    return (candidate["block_nmse"], candidate["mixer_nmse"]) < (
-        best["block_nmse"],
-        best["mixer_nmse"],
+    return (candidate["layer_output_nmse"], candidate["tmix_output_nmse"]) < (
+        best["layer_output_nmse"],
+        best["tmix_output_nmse"],
     )
 
 
@@ -196,17 +196,17 @@ def _evaluate_layer(source_text, student, layer_idx, hidden, world, device):
     layer.train()
     for batch in hidden.split(8):
         batch = batch.to(device)
-        wanted_mixer = _teacher_mixer(source_text, layer_idx, batch).float()
-        actual_mixer = _student_mixer(student, layer_idx, batch).float()
-        wanted_block = _teacher_layer(source_text, layer_idx, batch).float()
-        actual_block = layer(
+        wanted_tmix = _teacher_tmix_output(source_text, layer_idx, batch).float()
+        actual_tmix = _student_tmix_output(student, layer_idx, batch).float()
+        wanted_layer = _teacher_layer(source_text, layer_idx, batch).float()
+        actual_layer = layer(
             batch,
             None,
             None,
             torch.ones(batch.shape[:2], dtype=torch.bool, device=device),
         )[0].float()
         for offset, (actual, wanted) in enumerate(
-            ((actual_mixer, wanted_mixer), (actual_block, wanted_block))
+            ((actual_tmix, wanted_tmix), (actual_layer, wanted_layer))
         ):
             totals[offset * 4] += (actual - wanted).double().square().sum()
             totals[offset * 4 + 1] += wanted.double().square().sum()
@@ -221,13 +221,13 @@ def _evaluate_layer(source_text, student, layer_idx, hidden, world, device):
             dot / (wanted_sq * actual_sq).clamp_min(1e-48).sqrt()
         )
 
-    mixer_nmse, mixer_cosine = metrics(0)
-    block_nmse, block_cosine = metrics(4)
+    tmix_output_nmse, tmix_output_cosine = metrics(0)
+    layer_output_nmse, layer_output_cosine = metrics(4)
     return {
-        "mixer_nmse": mixer_nmse,
-        "mixer_cosine": mixer_cosine,
-        "block_nmse": block_nmse,
-        "block_cosine": block_cosine,
+        "tmix_output_nmse": tmix_output_nmse,
+        "tmix_output_cosine": tmix_output_cosine,
+        "layer_output_nmse": layer_output_nmse,
+        "layer_output_cosine": layer_output_cosine,
         "rows_per_rank": int(hidden.shape[0]),
         "tokens_per_rank": int(hidden.shape[0] * hidden.shape[1]),
         "valid_tokens": int(hidden.shape[0] * hidden.shape[1] * world),
@@ -310,24 +310,28 @@ def _layerwise(source_text, student, ids, output, rank, world, device, through_l
     # avoids pairing a newly saved layer with a stale cache after an interrupted
     # save/cache-advance window.
     _rebuild_cache(student, ids, cache, completed, device)
+    strict_failures: list[str] = []
+    prefix_strict_pass = True
     for index in range(completed, through_layer + 1):
         hidden_cache = cache.load()
         if hidden_cache.shape[0] < 32:
             raise ValueError("each rank needs at least 32 packed rows for isolated data splits")
-        calibration_local = hidden_cache[:8].to(device)
-        development = hidden_cache[8:16]
-        selection_local = development.to(device)
-        frozen_final = hidden_cache[16:24]
-        training = hidden_cache[24:]
-        calibration = _gather_calibration(calibration_local, world)
-        selection = _gather_calibration(selection_local, world)
+        init_local = hidden_cache[:8].to(device)
+        validation_hidden = hidden_cache[8:16]
+        validation_local = validation_hidden.to(device)
+        test_hidden = hidden_cache[16:24]
+        train_hidden = hidden_cache[24:]
+        init_hidden = _gather_init_hidden(init_local, world)
+        validation_for_init = _gather_init_hidden(validation_local, world)
         metrics = (
-            _initialize_layer(source_text, student, index, calibration, selection)
+            _initialize_layer(source_text, student, index, init_hidden, validation_for_init)
             if rank == 0
             else {}
         )
         if rank == 0:
-            _require_finite_tmix(student.model.layers[index].tmix, index, "zero-step compilation")
+            _require_finite_tmix(
+                student.model.layers[index].tmix, index, "before-distillation initialization"
+            )
         if world > 1:
             for parameter in student.model.layers[index].tmix.parameters():
                 dist.broadcast(parameter.data, 0)
@@ -351,44 +355,48 @@ def _layerwise(source_text, student, ids, output, rank, world, device, through_l
             betas=(0.9, 0.99),
             weight_decay=0.1,
         )
-        loader = DataLoader(TensorDataset(training), batch_size=8, shuffle=False)
+        loader = DataLoader(TensorDataset(train_hidden), batch_size=8, shuffle=False)
         max_epochs = 48
         scheduler = _schedule(optimizer, max_epochs * len(loader))
-        zero_development = _evaluate_layer(source_text, student, index, development, world, device)
-        _require_finite_metrics(zero_development, index, "zero-step development")
+        before_distillation_validation = _evaluate_layer(
+            source_text, student, index, validation_hidden, world, device
+        )
+        _require_finite_metrics(
+            before_distillation_validation, index, "before-distillation validation"
+        )
         if rank == 0:
             print(
                 {
                     "layer": index,
-                    "split": "development",
-                    "stage": "zero_step",
-                    **zero_development,
+                    "split": "validation",
+                    "stage": "before_distillation",
+                    **before_distillation_validation,
                     **metrics,
                 },
                 flush=True,
             )
-        best_development = dict(zero_development)
+        best_validation = dict(before_distillation_validation)
         best_state = {
             name: value.detach().cpu().clone() for name, value in tmix.state_dict().items()
         }
-        feasible_without_mixer_improvement = 0
+        epochs_without_validation_tmix_improvement = 0
         for epoch in range(max_epochs):
-            block_total = torch.zeros((), device=device)
-            mixer_total = torch.zeros((), device=device)
+            layer_output_total = torch.zeros((), device=device)
+            tmix_output_total = torch.zeros((), device=device)
             for (hidden,) in loader:
                 hidden = hidden.to(device)
                 with torch.no_grad():
-                    wanted = _teacher_layer(source_text, index, hidden)
-                    wanted_mixer = _teacher_mixer(source_text, index, hidden)
-                actual = wrapper(hidden)
-                actual_mixer = _student_mixer(student, index, hidden)
-                block_loss = (actual.float() - wanted.float()).square().mean() / (
-                    wanted.float().square().mean() + 1e-6
+                    wanted_layer = _teacher_layer(source_text, index, hidden)
+                    wanted_tmix = _teacher_tmix_output(source_text, index, hidden)
+                actual_layer = wrapper(hidden)
+                actual_tmix = _student_tmix_output(student, index, hidden)
+                layer_output_loss = (
+                    actual_layer.float() - wanted_layer.float()
+                ).square().mean() / (wanted_layer.float().square().mean() + 1e-6)
+                tmix_output_loss = (actual_tmix.float() - wanted_tmix.float()).square().mean() / (
+                    wanted_tmix.float().square().mean() + 1e-6
                 )
-                mixer_loss = (actual_mixer.float() - wanted_mixer.float()).square().mean() / (
-                    wanted_mixer.float().square().mean() + 1e-6
-                )
-                loss = block_loss + mixer_loss
+                loss = layer_output_loss + tmix_output_loss
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"non-finite layer {index} loss")
                 optimizer.zero_grad(set_to_none=True)
@@ -409,98 +417,98 @@ def _layerwise(source_text, student, ids, output, rank, world, device, through_l
                 scheduler.step()
                 if hasattr(tmix, "value_residual_scale"):
                     tmix.value_residual_scale.data.zero_()
-                block_total += block_loss.detach() / len(loader)
-                mixer_total += mixer_loss.detach() / len(loader)
-            train_block_nmse = _mean(block_total, world)
-            train_mixer_nmse = _mean(mixer_total, world)
-            if not math.isfinite(train_block_nmse) or not math.isfinite(train_mixer_nmse):
+                layer_output_total += layer_output_loss.detach() / len(loader)
+                tmix_output_total += tmix_output_loss.detach() / len(loader)
+            train_layer_output_nmse = _mean(layer_output_total, world)
+            train_tmix_output_nmse = _mean(tmix_output_total, world)
+            if not math.isfinite(train_layer_output_nmse) or not math.isfinite(
+                train_tmix_output_nmse
+            ):
                 raise FloatingPointError(f"non-finite layer {index} epoch {epoch} train metrics")
-            development_metrics = _evaluate_layer(
-                source_text, student, index, development, world, device
+            validation_metrics = _evaluate_layer(
+                source_text, student, index, validation_hidden, world, device
             )
-            _require_finite_metrics(development_metrics, index, f"epoch {epoch} development")
-            previous_best_feasible = best_development["block_nmse"] <= BLOCK_NMSE_TARGET
-            previous_best_mixer = best_development["mixer_nmse"]
-            improved = _development_is_better(development_metrics, best_development)
+            _require_finite_metrics(validation_metrics, index, f"epoch {epoch} validation")
+            previous_best_passed = best_validation["layer_output_nmse"] <= LAYER_OUTPUT_NMSE_TARGET
+            previous_best_tmix = best_validation["tmix_output_nmse"]
+            improved = _validation_is_better(validation_metrics, best_validation)
             if improved:
-                best_development = dict(development_metrics)
+                best_validation = dict(validation_metrics)
                 best_state = {
                     name: value.detach().cpu().clone() for name, value in tmix.state_dict().items()
                 }
-                if development_metrics["block_nmse"] <= BLOCK_NMSE_TARGET:
+                if validation_metrics["layer_output_nmse"] <= LAYER_OUTPUT_NMSE_TARGET:
                     if (
-                        not previous_best_feasible
-                        or development_metrics["mixer_nmse"] < previous_best_mixer
+                        not previous_best_passed
+                        or validation_metrics["tmix_output_nmse"] < previous_best_tmix
                     ):
-                        feasible_without_mixer_improvement = 0
+                        epochs_without_validation_tmix_improvement = 0
                     else:
-                        feasible_without_mixer_improvement += 1
-            elif best_development["block_nmse"] <= BLOCK_NMSE_TARGET:
-                feasible_without_mixer_improvement += 1
+                        epochs_without_validation_tmix_improvement += 1
+            elif best_validation["layer_output_nmse"] <= LAYER_OUTPUT_NMSE_TARGET:
+                epochs_without_validation_tmix_improvement += 1
             if rank == 0:
                 print(
                     {
                         "layer": index,
                         "epoch": epoch,
-                        "train_block_nmse": train_block_nmse,
-                        "train_mixer_nmse": train_mixer_nmse,
-                        "development_block_nmse": development_metrics["block_nmse"],
-                        "development_mixer_nmse": development_metrics["mixer_nmse"],
-                        "best_development_block_nmse": best_development["block_nmse"],
-                        "best_development_mixer_nmse": best_development["mixer_nmse"],
-                        "feasible_mixer_patience": feasible_without_mixer_improvement,
+                        "train_tmix_output_nmse": train_tmix_output_nmse,
+                        "train_layer_output_nmse": train_layer_output_nmse,
+                        "validation_tmix_output_nmse": validation_metrics["tmix_output_nmse"],
+                        "validation_layer_output_nmse": validation_metrics["layer_output_nmse"],
+                        "best_validation_tmix_output_nmse": best_validation["tmix_output_nmse"],
+                        "best_validation_layer_output_nmse": best_validation["layer_output_nmse"],
+                        "epochs_without_validation_tmix_improvement": (
+                            epochs_without_validation_tmix_improvement
+                        ),
                     },
                     flush=True,
                 )
             if (
-                best_development["block_nmse"] <= BLOCK_NMSE_TARGET
-                and feasible_without_mixer_improvement >= FEASIBLE_MIXER_PATIENCE
+                best_validation["layer_output_nmse"] <= LAYER_OUTPUT_NMSE_TARGET
+                and epochs_without_validation_tmix_improvement >= VALIDATION_TMIX_PATIENCE
             ):
                 break
         tmix.load_state_dict(best_state)
-        _require_finite_tmix(tmix, index, "selected checkpoint")
-        training_metrics = _evaluate_layer(source_text, student, index, training, world, device)
-        _require_finite_metrics(training_metrics, index, "selected optimizer-train")
-        development_metrics = _evaluate_layer(
-            source_text, student, index, development, world, device
+        _require_finite_tmix(tmix, index, "best validation checkpoint")
+        train_metrics = _evaluate_layer(source_text, student, index, train_hidden, world, device)
+        _require_finite_metrics(train_metrics, index, "best checkpoint on train")
+        validation_metrics = _evaluate_layer(
+            source_text, student, index, validation_hidden, world, device
         )
-        _require_finite_metrics(development_metrics, index, "selected development")
-        if development_metrics["block_nmse"] > BLOCK_NMSE_TARGET:
-            raise RuntimeError(
-                f"layer {index} development block NMSE "
-                f"{development_metrics['block_nmse']:.8g} exceeds "
-                f"{BLOCK_NMSE_TARGET} after {max_epochs} epochs"
+        _require_finite_metrics(validation_metrics, index, "best checkpoint on validation")
+        test_metrics = _evaluate_layer(source_text, student, index, test_hidden, world, device)
+        _require_finite_metrics(test_metrics, index, "best checkpoint on test")
+        validation_pass = validation_metrics["layer_output_nmse"] <= LAYER_OUTPUT_NMSE_TARGET
+        test_pass = test_metrics["layer_output_nmse"] <= LAYER_OUTPUT_NMSE_TARGET
+        layer_strict_pass = validation_pass and test_pass
+        prefix_strict_pass = prefix_strict_pass and layer_strict_pass
+        if not layer_strict_pass:
+            strict_failures.append(
+                f"layer {index} validation={validation_metrics['layer_output_nmse']:.8g} "
+                f"test={test_metrics['layer_output_nmse']:.8g}"
             )
-        final_metrics = _evaluate_layer(source_text, student, index, frozen_final, world, device)
-        _require_finite_metrics(final_metrics, index, "frozen-final")
         if rank == 0:
             print(
                 {
                     "layer": index,
-                    "split": "frozen_final",
-                    "zero_step_mixer_nmse": zero_development["mixer_nmse"],
-                    "zero_step_mixer_cosine": zero_development["mixer_cosine"],
-                    "zero_step_block_nmse": zero_development["block_nmse"],
-                    "zero_step_block_cosine": zero_development["block_cosine"],
-                    "selected_train_mixer_nmse": training_metrics["mixer_nmse"],
-                    "selected_train_mixer_cosine": training_metrics["mixer_cosine"],
-                    "selected_train_block_nmse": training_metrics["block_nmse"],
-                    "selected_train_block_cosine": training_metrics["block_cosine"],
-                    "selected_development_mixer_nmse": development_metrics["mixer_nmse"],
-                    "selected_development_mixer_cosine": development_metrics["mixer_cosine"],
-                    "selected_development_block_nmse": development_metrics["block_nmse"],
-                    "selected_development_block_cosine": development_metrics["block_cosine"],
-                    "initializer_metrics": metrics,
-                    **final_metrics,
+                    "stage": "best_checkpoint_evaluation",
+                    **{
+                        f"before_distillation_validation_{name}": value
+                        for name, value in before_distillation_validation.items()
+                    },
+                    **{f"train_{name}": value for name, value in train_metrics.items()},
+                    **{f"validation_{name}": value for name, value in validation_metrics.items()},
+                    **{f"test_{name}": value for name, value in test_metrics.items()},
+                    "validation_pass": validation_pass,
+                    "test_pass": test_pass,
+                    "layer_strict_pass": layer_strict_pass,
+                    "prefix_strict_pass": prefix_strict_pass,
+                    "initialization_metrics": metrics,
                 },
                 flush=True,
             )
-        if final_metrics["block_nmse"] > BLOCK_NMSE_TARGET:
-            raise RuntimeError(
-                f"layer {index} frozen-final block NMSE "
-                f"{final_metrics['block_nmse']:.8g} exceeds {BLOCK_NMSE_TARGET}"
-            )
-        if rank == 0:
+        if rank == 0 and prefix_strict_pass:
             _save_layer(output, index, tmix)
         if world > 1:
             dist.barrier()
@@ -515,6 +523,11 @@ def _layerwise(source_text, student, ids, output, rank, world, device, through_l
                 )
         cache.store(torch.cat(chunks), "next")
         cache.advance()
+    if strict_failures:
+        raise RuntimeError(
+            f"strict layer-output NMSE target {LAYER_OUTPUT_NMSE_TARGET} failed after "
+            f"measuring through layer {through_layer}: {'; '.join(strict_failures)}"
+        )
     return cache
 
 

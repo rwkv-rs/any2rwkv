@@ -286,74 +286,74 @@ def _fit_r_k(target, hidden: torch.Tensor, wanted: torch.Tensor) -> float:
 
 def refit_native_output(
     target,
-    normalized_hidden: torch.Tensor,
+    init_hidden: torch.Tensor,
     source_output: torch.Tensor,
     prior_weight: torch.Tensor | None = None,
-    selection_hidden: torch.Tensor | None = None,
-    selection_source_output: torch.Tensor | None = None,
+    validation_hidden: torch.Tensor | None = None,
+    validation_source_output: torch.Tensor | None = None,
 ) -> dict[str, float]:
-    if (selection_hidden is None) != (selection_source_output is None):
-        raise ValueError("selection hidden and source output must be provided together")
+    if (validation_hidden is None) != (validation_source_output is None):
+        raise ValueError("validation hidden and source output must be provided together")
     snapshot = _snapshot(target)
-    prior_calibration_nmse = _nmse(_native_forward(target, normalized_hidden), source_output)
-    prior_selection_nmse = math.nan
-    if selection_hidden is not None:
-        prior_selection_nmse = _nmse(
-            _native_forward(target, selection_hidden), selection_source_output
+    prior_init_nmse = _nmse(_native_forward(target, init_hidden), source_output)
+    prior_validation_nmse = math.nan
+    if validation_hidden is not None:
+        prior_validation_nmse = _nmse(
+            _native_forward(target, validation_hidden), validation_source_output
         )
     prior = (
         target.output.weight.detach().float().clone()
         if prior_weight is None
         else prior_weight.float().clone()
     )
-    previous_calibration = math.inf
+    previous_init = math.inf
     rounds = 0
     for round_index in range(BOUNDARY_ROUNDS):
         rounds = round_index + 1
-        output_nmse = _fit_output_weight(target, normalized_hidden, source_output, prior)
+        output_nmse = _fit_output_weight(target, init_hidden, source_output, prior)
         if not math.isfinite(output_nmse):
             break
-        r_k_nmse = _fit_r_k(target, normalized_hidden, source_output)
+        r_k_nmse = _fit_r_k(target, init_hidden, source_output)
         if not math.isfinite(r_k_nmse):
             break
         prior = target.output.weight.detach().float().clone()
-        calibration_nmse = _fit_output_weight(target, normalized_hidden, source_output, prior)
-        if not math.isfinite(calibration_nmse):
+        init_nmse = _fit_output_weight(target, init_hidden, source_output, prior)
+        if not math.isfinite(init_nmse):
             break
-        relative = (previous_calibration - calibration_nmse) / max(abs(previous_calibration), 1e-12)
-        previous_calibration = calibration_nmse
+        relative = (previous_init - init_nmse) / max(abs(previous_init), 1e-12)
+        previous_init = init_nmse
         if relative >= 0 and relative < 1e-4:
             break
 
-    candidate_calibration_nmse = _nmse(_native_forward(target, normalized_hidden), source_output)
-    candidate_selection_nmse = math.nan
-    selected = math.isfinite(candidate_calibration_nmse)
-    if selection_hidden is not None:
-        candidate_selection_nmse = _nmse(
-            _native_forward(target, selection_hidden), selection_source_output
+    candidate_init_nmse = _nmse(_native_forward(target, init_hidden), source_output)
+    candidate_validation_nmse = math.nan
+    accepted = math.isfinite(candidate_init_nmse)
+    if validation_hidden is not None:
+        candidate_validation_nmse = _nmse(
+            _native_forward(target, validation_hidden), validation_source_output
         )
-        selected = (
-            selected
-            and math.isfinite(candidate_selection_nmse)
-            and (candidate_selection_nmse < prior_selection_nmse)
+        accepted = (
+            accepted
+            and math.isfinite(candidate_validation_nmse)
+            and (candidate_validation_nmse < prior_validation_nmse)
         )
-    if not selected:
+    if not accepted:
         _restore(target, snapshot)
-    installed_calibration_nmse = _nmse(_native_forward(target, normalized_hidden), source_output)
-    installed_selection_nmse = math.nan
-    if selection_hidden is not None:
-        installed_selection_nmse = _nmse(
-            _native_forward(target, selection_hidden), selection_source_output
+    installed_init_nmse = _nmse(_native_forward(target, init_hidden), source_output)
+    installed_validation_nmse = math.nan
+    if validation_hidden is not None:
+        installed_validation_nmse = _nmse(
+            _native_forward(target, validation_hidden), validation_source_output
         )
     return {
-        "native_boundary_calibration_nmse": installed_calibration_nmse,
-        "native_boundary_calibration_prior_nmse": prior_calibration_nmse,
-        "native_boundary_calibration_candidate_nmse": candidate_calibration_nmse,
-        "native_boundary_calibration_installed_nmse": installed_calibration_nmse,
-        "native_boundary_selection_prior_nmse": prior_selection_nmse,
-        "native_boundary_selection_candidate_nmse": candidate_selection_nmse,
-        "native_boundary_selection_installed_nmse": installed_selection_nmse,
-        "native_boundary_candidate_selected": float(selected),
+        "native_boundary_init_nmse": installed_init_nmse,
+        "native_boundary_init_prior_nmse": prior_init_nmse,
+        "native_boundary_init_candidate_nmse": candidate_init_nmse,
+        "native_boundary_init_installed_nmse": installed_init_nmse,
+        "native_boundary_validation_prior_nmse": prior_validation_nmse,
+        "native_boundary_validation_candidate_nmse": candidate_validation_nmse,
+        "native_boundary_validation_installed_nmse": installed_validation_nmse,
+        "native_boundary_candidate_accepted": float(accepted),
         "native_boundary_rounds": float(rounds),
     }
 
@@ -549,7 +549,7 @@ def _fit_linear_projection(target, name, module, x, wanted):
     return ratio, fitted, _nmse(actual, wanted)
 
 
-def _selection_projection_nmse(x, wanted, ratio, projection):
+def _validation_projection_nmse(x, wanted, ratio, projection):
     actual = _mixed(x, _previous(x), ratio) @ projection
     return _nmse(actual, wanted)
 
@@ -557,160 +557,164 @@ def _selection_projection_nmse(x, wanted, ratio, projection):
 def _compile_gqa_candidate(
     source,
     target,
-    x: torch.Tensor,
-    trace,
-    selection_hidden: torch.Tensor,
-    selection_trace,
+    init_hidden: torch.Tensor,
+    init_trace,
+    validation_hidden: torch.Tensor,
+    validation_trace,
     closure: float,
 ) -> dict[str, float]:
-    channels = x.shape[-1]
+    channels = init_hidden.shape[-1]
     fitted_projections = {}
     projection_metrics = {}
     for name, wanted, module in (
-        ("r", trace["q_target"], target.receptance),
-        ("k", trace["k_target"], target.key),
+        ("r", init_trace["q_target"], target.receptance),
+        ("k", init_trace["k_target"], target.key),
     ):
-        ratio, fitted, calibration_nmse = _fit_linear_projection(target, name, module, x, wanted)
+        ratio, fitted, init_nmse = _fit_linear_projection(target, name, module, init_hidden, wanted)
         fitted_projections[name] = (ratio, fitted)
-        projection_metrics[f"{name}_projection_calibration_nmse"] = calibration_nmse
+        projection_metrics[f"{name}_projection_init_nmse"] = init_nmse
 
-    ratio, fitted = fit_time_mix(x, _previous(x), trace["value_target"])
+    ratio, fitted = fit_time_mix(init_hidden, _previous(init_hidden), init_trace["value_target"])
     target.x_v.copy_(ratio.view(1, 1, channels))
     target.value_base.weight.copy_(
-        torch.eye(channels, dtype=target.value_base.weight.dtype, device=x.device)
+        torch.eye(channels, dtype=target.value_base.weight.dtype, device=init_hidden.device)
     )
     target.value_expand.weight.copy_(fitted.T.to(target.value_expand.weight))
-    value_actual = _mixed(x, _previous(x), ratio) @ target.value_expand.weight.float().T
-    projection_metrics["v_projection_calibration_nmse"] = _nmse(value_actual, trace["value_target"])
+    value_actual = (
+        _mixed(init_hidden, _previous(init_hidden), ratio) @ target.value_expand.weight.float().T
+    )
+    projection_metrics["v_projection_init_nmse"] = _nmse(value_actual, init_trace["value_target"])
     fitted_projections["v"] = (ratio, fitted)
 
-    rho = trace["rho"]
-    batch, length = x.shape[:2]
+    rho = init_trace["rho"]
+    batch, length = init_hidden.shape[:2]
     requested_decay = (1 - rho).expand(batch, length, 8, 256)
     log_decay = requested_decay.clamp_min(1e-6).log()
     realized_log_decay = log_decay.clamp_min(W_SCALE + 1e-6)
     realized_decay = realized_log_decay.exp()
-    matrix_erase = closure * rho * trace["centered_norm"].square()
+    matrix_erase = closure * rho * init_trace["centered_norm"].square()
     mean_erase = (realized_decay - requested_decay).clamp_min(1e-6)
     erase = torch.stack((matrix_erase.expand_as(requested_decay), mean_erase), dim=3)
     decay_target = _native_decay_inverse(
         torch.stack((log_decay, log_decay), dim=3).reshape(batch, length, 4096)
     )
     erase_target = torch.logit(erase.clamp(1e-6, 1 - 1e-6).reshape(batch, length, 4096))
-    selection_rho = selection_trace["rho"]
-    selection_batch, selection_length = selection_hidden.shape[:2]
-    selection_requested_decay = (1 - selection_rho).expand(
-        selection_batch, selection_length, 8, 256
+    validation_rho = validation_trace["rho"]
+    validation_batch, validation_length = validation_hidden.shape[:2]
+    validation_requested_decay = (1 - validation_rho).expand(
+        validation_batch, validation_length, 8, 256
     )
-    selection_log_decay = selection_requested_decay.clamp_min(1e-6).log()
-    selection_realized_decay = selection_log_decay.clamp_min(W_SCALE + 1e-6).exp()
-    selection_matrix_erase = closure * selection_rho * selection_trace["centered_norm"].square()
-    selection_mean_erase = (selection_realized_decay - selection_requested_decay).clamp_min(1e-6)
-    selection_erase = torch.stack(
+    validation_log_decay = validation_requested_decay.clamp_min(1e-6).log()
+    validation_realized_decay = validation_log_decay.clamp_min(W_SCALE + 1e-6).exp()
+    validation_matrix_erase = closure * validation_rho * validation_trace["centered_norm"].square()
+    validation_mean_erase = (validation_realized_decay - validation_requested_decay).clamp_min(1e-6)
+    validation_erase = torch.stack(
         (
-            selection_matrix_erase.expand_as(selection_requested_decay),
-            selection_mean_erase,
+            validation_matrix_erase.expand_as(validation_requested_decay),
+            validation_mean_erase,
         ),
         dim=3,
     )
-    selection_decay_target = _native_decay_inverse(
-        torch.stack((selection_log_decay, selection_log_decay), dim=3).reshape(
-            selection_batch, selection_length, 4096
+    validation_decay_target = _native_decay_inverse(
+        torch.stack((validation_log_decay, validation_log_decay), dim=3).reshape(
+            validation_batch, validation_length, 4096
         )
     )
-    selection_erase_target = torch.logit(
-        selection_erase.clamp(1e-6, 1 - 1e-6).reshape(selection_batch, selection_length, 4096)
+    validation_erase_target = torch.logit(
+        validation_erase.clamp(1e-6, 1 - 1e-6).reshape(validation_batch, validation_length, 4096)
     )
     for stem, wanted in (("w", decay_target), ("a", erase_target)):
-        ratio, _ = fit_time_mix(x, _previous(x), wanted)
+        ratio, _ = fit_time_mix(init_hidden, _previous(init_hidden), wanted)
         ratio_parameter = getattr(target, f"x_{stem}")
         ratio_parameter.copy_(ratio.view(1, 1, -1).to(ratio_parameter))
-        mixed = _mixed(x, _previous(x), ratio)
+        mixed = _mixed(init_hidden, _previous(init_hidden), ratio)
         bias, first, second = _low_rank_target(mixed, wanted, 128, nonlinear=stem == "w")
         getattr(target, f"{stem}0").copy_(bias.view(1, 1, -1).to(ratio_parameter))
         getattr(target, f"{stem}1").copy_(first.to(ratio_parameter))
         getattr(target, f"{stem}2").copy_(second.to(ratio_parameter))
         label = "decay" if stem == "w" else "erase"
-        selection_wanted = selection_decay_target if stem == "w" else selection_erase_target
-        projection_metrics[f"{label}_projection_calibration_nmse"] = _nmse(
-            _control_signal(target, stem, x), wanted
+        validation_wanted = validation_decay_target if stem == "w" else validation_erase_target
+        projection_metrics[f"{label}_projection_init_nmse"] = _nmse(
+            _control_signal(target, stem, init_hidden), wanted
         )
-        projection_metrics[f"{label}_projection_selection_nmse"] = _nmse(
-            _control_signal(target, stem, selection_hidden), selection_wanted
+        projection_metrics[f"{label}_projection_validation_nmse"] = _nmse(
+            _control_signal(target, stem, validation_hidden), validation_wanted
         )
 
-    gate_nmse, gate_ratio, _ = fit_native_gate(target, x, _previous(x), trace["gate"])
+    gate_nmse, gate_ratio, _ = fit_native_gate(
+        target, init_hidden, _previous(init_hidden), init_trace["gate"]
+    )
     target.k_k.fill_(1)
     target.k_a.zero_()
     target.r_k.zero_()
     target.value_residual_scale.zero_()
     groupnorm_nmse = fit_groupnorm_affine(
         target,
-        _native_raw_heads(target, x),
-        trace["exact_attention"].transpose(1, 2),
+        _native_raw_heads(target, init_hidden),
+        init_trace["exact_attention"].transpose(1, 2),
     )
-    projection_metrics["groupnorm_affine_calibration_nmse"] = groupnorm_nmse
-    projection_metrics["groupnorm_affine_selection_nmse"] = _nmse(
-        _apply_groupnorm_affine(target, _native_raw_heads(target, selection_hidden)),
-        selection_trace["exact_attention"].transpose(1, 2),
+    projection_metrics["groupnorm_affine_init_nmse"] = groupnorm_nmse
+    projection_metrics["groupnorm_affine_validation_nmse"] = _nmse(
+        _apply_groupnorm_affine(target, _native_raw_heads(target, validation_hidden)),
+        validation_trace["exact_attention"].transpose(1, 2),
     )
     target.output.weight.copy_(source.o_proj.weight.to(target.output.weight))
     boundary_metrics = refit_native_output(
         target,
-        x,
-        trace["source_output"],
+        init_hidden,
+        init_trace["source_output"],
         source.o_proj.weight,
-        selection_hidden,
-        selection_trace["source_output"],
+        validation_hidden,
+        validation_trace["source_output"],
     )
 
-    selection_targets = {
-        "r": selection_trace["q_target"],
-        "k": selection_trace["k_target"],
-        "v": selection_trace["value_target"],
+    validation_targets = {
+        "r": validation_trace["q_target"],
+        "k": validation_trace["k_target"],
+        "v": validation_trace["value_target"],
     }
-    for name, wanted in selection_targets.items():
+    for name, wanted in validation_targets.items():
         ratio, projection = fitted_projections[name]
-        projection_metrics[f"{name}_projection_selection_nmse"] = _selection_projection_nmse(
-            selection_hidden, wanted, ratio, projection
+        projection_metrics[f"{name}_projection_validation_nmse"] = _validation_projection_nmse(
+            validation_hidden, wanted, ratio, projection
         )
-    projection_metrics["gate_projection_calibration_nmse"] = gate_nmse
-    selection_gate = (
+    projection_metrics["gate_projection_init_nmse"] = gate_nmse
+    validation_gate = (
         torch.sigmoid(
             _mixed(
-                selection_hidden,
-                _previous(selection_hidden),
+                validation_hidden,
+                _previous(validation_hidden),
                 gate_ratio,
             )
             @ target.g1.float()
         )
         @ target.g2.float()
     )
-    projection_metrics["gate_projection_selection_nmse"] = _nmse(
-        selection_gate, selection_trace["gate"]
+    projection_metrics["gate_projection_validation_nmse"] = _nmse(
+        validation_gate, validation_trace["gate"]
     )
 
-    affine_nmse, native_nmse = _trajectory_diagnostics(
-        trace["query"],
-        trace["centered_key"],
-        trace["value_innovation"],
-        trace["mean_value"],
-        trace["exact_attention"],
+    init_affine_nmse, init_native_nmse = _trajectory_diagnostics(
+        init_trace["query"],
+        init_trace["centered_key"],
+        init_trace["value_innovation"],
+        init_trace["mean_value"],
+        init_trace["exact_attention"],
         closure,
     )
-    selection_affine_nmse, selection_native_nmse = _trajectory_diagnostics(
-        selection_trace["query"],
-        selection_trace["centered_key"],
-        selection_trace["value_innovation"],
-        selection_trace["mean_value"],
-        selection_trace["exact_attention"],
+    validation_affine_nmse, validation_native_nmse = _trajectory_diagnostics(
+        validation_trace["query"],
+        validation_trace["centered_key"],
+        validation_trace["value_innovation"],
+        validation_trace["mean_value"],
+        validation_trace["exact_attention"],
         closure,
     )
     return {
-        "reference_affine_attention_calibration_nmse": affine_nmse,
-        "reference_affine_attention_selection_nmse": selection_affine_nmse,
-        "initialized_native_clamp_delta_calibration_nmse": native_nmse,
-        "initialized_native_clamp_delta_selection_nmse": selection_native_nmse,
+        "reference_affine_attention_init_nmse": init_affine_nmse,
+        "reference_affine_attention_validation_nmse": validation_affine_nmse,
+        "initialized_native_clamp_delta_init_nmse": init_native_nmse,
+        "initialized_native_clamp_delta_validation_nmse": validation_native_nmse,
         "initialized_closure": closure,
         **{f"fitted_{name}": value for name, value in projection_metrics.items()},
         **{f"fitted_{name}": value for name, value in boundary_metrics.items()},
@@ -721,16 +725,16 @@ def _compile_gqa_candidate(
 def initialize_gqa_layer(
     source,
     target,
-    normalized_hidden: torch.Tensor,
-    position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    selection_hidden: torch.Tensor | None = None,
-    selection_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    init_hidden: torch.Tensor,
+    init_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    validation_hidden: torch.Tensor | None = None,
+    validation_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> dict[str, float]:
-    """Select a complete canonical two-state D256 initialization on development."""
-    if selection_hidden is None or selection_position_embeddings is None:
-        raise ValueError("GQA compilation requires an independent development split")
-    trace = _gqa_trace(source, normalized_hidden, position_embeddings)
-    selection_trace = _gqa_trace(source, selection_hidden, selection_position_embeddings)
+    """Fit GQA candidates on init data and choose one on validation data."""
+    if validation_hidden is None or validation_position_embeddings is None:
+        raise ValueError("GQA compilation requires independent validation data")
+    init_trace = _gqa_trace(source, init_hidden, init_position_embeddings)
+    validation_trace = _gqa_trace(source, validation_hidden, validation_position_embeddings)
     initial = _snapshot(target)
     candidates = []
     for closure in CLOSURE_CANDIDATES:
@@ -739,21 +743,21 @@ def initialize_gqa_layer(
             metrics = _compile_gqa_candidate(
                 source,
                 target,
-                normalized_hidden,
-                trace,
-                selection_hidden,
-                selection_trace,
+                init_hidden,
+                init_trace,
+                validation_hidden,
+                validation_trace,
                 closure,
             )
-            selection_nmse = _nmse(
-                _native_forward(target, selection_hidden),
-                selection_trace["source_output"],
+            validation_nmse = _nmse(
+                _native_forward(target, validation_hidden),
+                validation_trace["source_output"],
             )
             candidate_state = _snapshot(target)
         except Exception:
             _restore(target, initial)
             raise
-        candidates.append((selection_nmse, closure, candidate_state, metrics))
+        candidates.append((validation_nmse, closure, candidate_state, metrics))
     finite = [
         candidate
         for candidate in candidates
@@ -762,32 +766,29 @@ def initialize_gqa_layer(
     if not finite:
         _restore(target, initial)
         raise FloatingPointError("all GQA closure candidates were non-finite")
-    selection_nmse, closure, selected_state, selected_metrics = min(
-        finite, key=lambda candidate: candidate[0]
-    )
-    _restore(target, selected_state)
-    requested_decay = 1 - trace["rho"]
+    validation_nmse, _, best_state, best_metrics = min(finite, key=lambda candidate: candidate[0])
+    _restore(target, best_state)
+    requested_decay = 1 - init_trace["rho"]
     return {
-        "reference_mean_exact_hazard": trace["mean_exact_hazard"],
-        "reference_source_trace_output_nmse": trace["reference_source_output_nmse"],
-        "reference_empirical_kernel_tail_ratio": trace["empirical_kernel_tail_ratio"],
-        "reference_selection_empirical_kernel_tail_ratio": selection_trace[
+        "reference_init_mean_exact_hazard": init_trace["mean_exact_hazard"],
+        "reference_init_source_trace_output_nmse": init_trace["reference_source_output_nmse"],
+        "reference_init_empirical_kernel_tail_ratio": init_trace["empirical_kernel_tail_ratio"],
+        "reference_validation_empirical_kernel_tail_ratio": validation_trace[
             "empirical_kernel_tail_ratio"
         ],
-        "initialized_selected_closure": closure,
-        "fitted_compiled_selection_mixer_nmse": selection_nmse,
-        "initialized_matrix_state_key_rms": trace["matrix_state_key_rms"],
-        "initialized_matrix_state_write_rms": trace["matrix_state_write_rms"],
-        "initialized_mean_state_write_rms": trace["mean_state_write_rms"],
-        "initialized_requested_decay_below_native_floor_fraction": float(
+        "fitted_compiled_validation_tmix_output_nmse": validation_nmse,
+        "init_matrix_state_key_rms": init_trace["matrix_state_key_rms"],
+        "init_matrix_state_write_rms": init_trace["matrix_state_write_rms"],
+        "init_mean_state_write_rms": init_trace["mean_state_write_rms"],
+        "init_requested_decay_below_native_floor_fraction": float(
             (requested_decay.clamp_min(1e-6).log() < W_SCALE).float().mean()
         ),
-        "reference_trace_tokens": float(normalized_hidden.shape[0] * normalized_hidden.shape[1]),
+        "reference_init_trace_tokens": float(init_hidden.shape[0] * init_hidden.shape[1]),
         **{
-            f"fitted_closure_{str(value).replace('.', '_')}_selection_mixer_nmse": metric
+            f"fitted_closure_{str(value).replace('.', '_')}_validation_tmix_output_nmse": metric
             for metric, value, _, _ in candidates
         },
-        **selected_metrics,
+        **best_metrics,
     }
 
 

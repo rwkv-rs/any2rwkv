@@ -8,17 +8,17 @@ embeddings, decoder RMSNorm, MLP, residual structure, tokenizer, and tied LM
 head remain unchanged.
 
 GDN initialization is a strict source `state_dict` copy plus recurrence and
-Clamp-W diagnostics. GQA keeps its mathematical compiler. Both paths then use
-greedy block-output alignment followed by frozen-teacher logits-KL TMix
-fine-tuning. RWKV value residual belongs only to GQA layers: it remains zero
-during initialization/layerwise alignment and opens for later GQA layers only
-in the final stage.
+Clamp-W diagnostics. GQA keeps its mathematical compiler. Both paths then align
+each complete decoder-layer output while the original Qwen model remains fixed;
+the full-model path later adds logits-KL TMix fine-tuning. RWKV value residual
+belongs only to GQA layers: it remains zero during initialization and layerwise
+alignment, and opens for later GQA layers only during full-model fine-tuning.
 
 The product path requires the pinned `rwkv-rs/transformers-rwkv` revision and
 FlashRWKV2's native D128/D256 training and FP16 inference kernels. There is no
 Torch, FLA, or FP32-state recurrence fallback.
 
-## Development
+## Usage
 
 The project uses [uv](https://docs.astral.sh/uv/) and a `src` package layout.
 

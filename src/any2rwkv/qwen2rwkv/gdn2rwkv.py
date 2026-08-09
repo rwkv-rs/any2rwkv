@@ -132,7 +132,9 @@ def _trace_metrics(prefix: str, trace: dict[str, torch.Tensor]) -> dict[str, flo
         f"{prefix}_clamp_w_outside_fraction": float(outside.float().mean()),
         f"{prefix}_clamp_w_log_decay_nmse": _nmse(trace["realized_log_decay"], trace["log_decay"]),
         f"{prefix}_clamp_w_raw_nmse": _nmse(trace["clamped_raw"], trace["oracle_raw"]),
-        f"{prefix}_clamp_w_mixer_nmse": _nmse(trace["clamped_output"], trace["source_output"]),
+        f"{prefix}_clamp_w_tmix_output_nmse": _nmse(
+            trace["clamped_output"], trace["source_output"]
+        ),
     }
 
 
@@ -140,8 +142,8 @@ def _trace_metrics(prefix: str, trace: dict[str, torch.Tensor]) -> dict[str, flo
 def initialize_gdn_layer(
     source,
     target,
-    normalized_hidden: torch.Tensor,
-    selection_hidden: torch.Tensor | None = None,
+    init_hidden: torch.Tensor,
+    validation_hidden: torch.Tensor | None = None,
 ) -> dict[str, float]:
     """Strict-copy one source GDN shell and report recurrence/Clamp-W diagnostics."""
     target.load_state_dict(source.state_dict(), strict=True)
@@ -153,21 +155,21 @@ def initialize_gdn_layer(
     if unequal:
         raise RuntimeError(f"GDN source-shell copy mismatch: {unequal}")
 
-    calibration_trace = _gdn_trace(source, normalized_hidden)
+    init_trace = _gdn_trace(source, init_hidden)
     metrics = {
         "source_shell_parameter_tensors": float(len(source_state)),
         "source_shell_strict_copy": 1.0,
-        "calibration_trace_tokens": float(normalized_hidden.shape[0] * normalized_hidden.shape[1]),
-        **_trace_metrics("calibration", calibration_trace),
+        "init_trace_tokens": float(init_hidden.shape[0] * init_hidden.shape[1]),
+        **_trace_metrics("init", init_trace),
     }
-    if selection_hidden is not None:
-        selection_trace = _gdn_trace(source, selection_hidden)
+    if validation_hidden is not None:
+        validation_trace = _gdn_trace(source, validation_hidden)
         metrics.update(
             {
-                "selection_trace_tokens": float(
-                    selection_hidden.shape[0] * selection_hidden.shape[1]
+                "validation_trace_tokens": float(
+                    validation_hidden.shape[0] * validation_hidden.shape[1]
                 ),
-                **_trace_metrics("selection", selection_trace),
+                **_trace_metrics("validation", validation_trace),
             }
         )
     return metrics
