@@ -49,6 +49,26 @@ CLAMP_W_EPSILON = 1e-4
 W_SCALE = -math.exp(-0.5)
 
 
+class _FP32RotaryEmbedding(Qwen3_5TextRotaryEmbedding):
+    """Keep RoPE frequencies in FP32 across model-wide dtype conversions."""
+
+    def _apply(self, fn, recurse: bool = True):
+        names = ("inv_freq", "original_inv_freq")
+        protected = {name: self._buffers[name] for name in names}
+        for name in names:
+            self._buffers[name] = None
+        try:
+            result = super()._apply(fn, recurse=recurse)
+            device = fn(protected["inv_freq"].new_empty(0)).device
+        except Exception:
+            for name, value in protected.items():
+                self._buffers[name] = value
+            raise
+        for name, value in protected.items():
+            self._buffers[name] = value.to(device=device, dtype=torch.float32)
+        return result
+
+
 def _orthogonal_(parameter: torch.Tensor, gain: float) -> None:
     value = torch.empty_like(parameter, dtype=torch.float32)
     nn.init.orthogonal_(value, gain=gain)
@@ -771,7 +791,7 @@ class Qwen2RWKVTimeMix(nn.Module):
         )
         self.q_norm = Qwen3_5RMSNorm(self.head_size, eps=config.rms_norm_eps)
         self.k_norm = Qwen3_5RMSNorm(self.head_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen3_5TextRotaryEmbedding(config)
+        self.rotary_emb = _FP32RotaryEmbedding(config)
         self.feature_q_weight = nn.Parameter(
             torch.zeros(
                 self.num_heads,

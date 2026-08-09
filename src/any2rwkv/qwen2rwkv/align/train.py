@@ -25,6 +25,7 @@ from transformers import AutoTokenizer
 from ..gdn2rwkv import initialize_gdn_layer
 from ..gqa2rwkv import (
     ORACLE_BLOCK_NMSE_GATE,
+    _source_tmix_output,
     exact_gqa_teacher_targets,
     initialize_gqa_layer,
 )
@@ -145,8 +146,24 @@ def _initialize_layer(source_text, student, layer_idx, init_hidden, validation_h
             validation_embeddings,
         )
         with torch.no_grad():
-            probe = init_hidden[:1, : min(128, init_hidden.shape[1])]
-            wanted_block = _teacher_layer(source_text, layer_idx, probe).float()
+            probe_length = min(128, init_hidden.shape[1])
+            probe = init_hidden[:1, :probe_length]
+            probe_normalized = init_normalized[:1, :probe_length]
+            probe_embeddings = tuple(
+                value[:1, :probe_length] for value in init_embeddings
+            )
+            wanted_tmix = _source_tmix_output(
+                source_layer.self_attn,
+                probe_normalized,
+                probe_embeddings,
+            )
+            wanted_residual = probe + wanted_tmix.to(probe)
+            wanted_block = (
+                wanted_residual
+                + source_layer.mlp(
+                    source_layer.post_attention_layernorm(wanted_residual)
+                )
+            ).float()
             target_layer = student.model.layers[layer_idx]
             normalized = target_layer.input_layernorm(probe)
             tmix_output = target_layer.tmix.reference_forward(normalized)
