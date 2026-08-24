@@ -186,22 +186,23 @@ gradient clipping 保持不变。
 
 prefill 通过原 GDN causal Conv4 更新 conv cache；单 token decode 使用原 GDN
 `causal_conv1d_update` 原地推进相同 cache。WKV state 和 elapsed state 由现有 varlen
-operator 原地更新。当前产品路径在第一个 GQA 层前 fail closed，不再携带 GQA
-one-token shift、sidecar、value residual 或其它未验收 cache 状态。
+operator 原地更新。GQA 层继续保存原有 one-token shift/WKV cache。
+
+GDN 不生成、覆盖或消费 RWKV value-residual `v_first`。执行到第一个 GQA 层时，
+该 GQA 层从自己的 `value_base` 建立本次 forward 的 `v_first`；后续 GQA 层沿用。
 
 ## 5. 数据、指标和验收边界
 
 “蒸馏前”指严格复制原 GDN 参数，再执行 Clamp-W forward projection，不做参数拟合。
 每张卡上的数据固定分为三部分：
 
-- rows `0:8`：初始化集；GDN 只做蒸馏前诊断；
-- rows `8:24`：统一验证集；选择逐层最佳 checkpoint；
+- rows `0:8`：初始化集；GDN 只做蒸馏前诊断，GQA 用它计算解析初始化；
+- rows `8:24`：统一验证集；选择 GQA 初始化候选和逐层最佳 checkpoint；
 - rows `24:`：训练集；用于反向传播和参数更新。
 
-当前 `--through-layer 2` 覆盖前三层 GDN。第 3 层 GQA 尚无通过严格门槛的方法，
-调用时会在训练和保存 artifact 前明确失败。验证集选择出的最佳 GDN 权重会在训练集
-和统一验证集上分别测量。统一验证集的整层输出 NMSE 必须不高于 `3e-3`；TMix 输出
-NMSE 单独报告和优化，但不是独立硬门。
+当前 `--through-layer 3` 依次覆盖前三层 GDN 和第一层 GQA。验证集选择出的最佳
+权重会在训练集和统一验证集上分别测量。统一验证集的整层输出 NMSE 必须不高于
+`3e-3`；TMix 输出 NMSE 单独报告和优化，但不是独立硬门。
 
 某层未达到严格目标时，当前进程仍会在内存中继续测到 `--through-layer` 指定的层，
 以获得完整误差曲线；命令结束时仍返回失败。从第一个未通过层开始不保存正式

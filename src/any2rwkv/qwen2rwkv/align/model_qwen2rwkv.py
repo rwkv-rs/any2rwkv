@@ -9,6 +9,11 @@ import torch
 from ..transformers.modeling_qwen2rwkv import (
     GDN_CHECKPOINT_SCHEMA,
     GDN_MODE,
+    GQA_CHECKPOINT_SCHEMA,
+    GQA_NUM_EXPERTS,
+    GQA_READOUT_MODE,
+    GQA_ROUTER_LOW_RANK_DIM,
+    GQA_STATES_PER_EXPERT,
     Qwen2RWKVConfig,
     Qwen2RWKVForCausalLM,
 )
@@ -46,6 +51,11 @@ def _config(source_config) -> Qwen2RWKVConfig:
     values["layer_types"] = list(source_config.layer_types)
     values["gdn_mode"] = GDN_MODE
     values["gdn_checkpoint_schema"] = GDN_CHECKPOINT_SCHEMA
+    values["gqa_num_experts"] = GQA_NUM_EXPERTS
+    values["gqa_states_per_expert"] = GQA_STATES_PER_EXPERT
+    values["gqa_router_low_rank_dim"] = GQA_ROUTER_LOW_RANK_DIM
+    values["gqa_readout_mode"] = GQA_READOUT_MODE
+    values["gqa_checkpoint_schema"] = GQA_CHECKPOINT_SCHEMA
     return Qwen2RWKVConfig(**values)
 
 

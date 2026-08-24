@@ -1,22 +1,22 @@
 # Any2RWKV
 
-Any2RWKV is a research implementation for converting source-model TMix layers
-to RWKV. The current Qwen3.5-2B path supports only the first three GDN layers
-(`0..2`): each layer keeps the complete source frontend, control projections,
-`RMSNormGated`, and `out_proj`, while FlashRWKV2 executes its matrix-state
-recurrence as RWKV-7 WKV.
+Any2RWKV converts the Qwen3.5-2B text backbone to a hybrid RWKV model. Each GDN
+layer keeps its complete source frontend, control projections,
+`RMSNormGated`, and `out_proj`; only its matrix-state recurrence is executed by
+RWKV-7 WKV. Each GQA layer is still converted to a canonical RWKV-7 TMix. Qwen
+embeddings, decoder RMSNorm, MLP, residual structure, tokenizer, and tied LM
+head remain unchanged.
 
-The first GQA layer is deliberately unsupported. Bounded-hazard, dual-expert,
-PISA/PWT-sidecar, and Hedgehog/H2O attempts all failed their strict feasibility
-or layer-output gates. Their executable product paths have been removed, and
-the layer-3 boundary fails before training or checkpoint creation. See
-[`docs/gqa2rwkv.md`](docs/gqa2rwkv.md) for the measured rejection evidence.
+GDN initialization is a strict source `state_dict` copy plus recurrence and
+Clamp-W diagnostics. GQA keeps its mathematical compiler. Both paths then align
+each complete decoder-layer output while the original Qwen model remains fixed;
+the full-model path later adds logits-KL TMix fine-tuning. RWKV value residual
+belongs only to GQA layers: it remains zero during initialization and layerwise
+alignment, and opens for later GQA layers only during full-model fine-tuning.
 
-The GDN prefix uses a strict source `state_dict` copy plus recurrence and
-Clamp-W diagnostics, followed by complete decoder-layer alignment. The product
-path requires the pinned `rwkv-rs/transformers-rwkv` revision and FlashRWKV2's
-native D128 training operators. There is no Torch, FLA, or alternate recurrence
-fallback.
+The product path requires the pinned `rwkv-rs/transformers-rwkv` revision and
+FlashRWKV2's native D128/D256 training and FP16 inference kernels. There is no
+Torch, FLA, or FP32-state recurrence fallback.
 
 ## Usage
 
@@ -26,11 +26,7 @@ The project uses [uv](https://docs.astral.sh/uv/) and a `src` package layout.
 uv sync
 uv run python -m any2rwkv.qwen2rwkv.align.train \
   --source /home/caizus/Weights/Qwen/Qwen3.5-2B \
-  --output /path/to/Qwen3.5-2B-RWKV-GDN-prefix \
-  --through-layer 2 \
+  --output /path/to/Qwen3.5-2B-RWKV \
   --agentic nvidia/Nemotron-SFT-Agentic-v2 \
   --math nvidia/Nemotron-SFT-Math-v4
 ```
-
-This command produces validated layer checkpoints and the post-layer cache for
-the GDN prefix. It does not produce or advertise a complete converted model.
