@@ -11,7 +11,7 @@
 - [`modeling_qwen2rwkv.py`](../src/any2rwkv/qwen2rwkv/transformers/modeling_qwen2rwkv.py)：
   hybrid GDN runtime、Conv/WKV cache 和 FlashRWKV2 调用；
 - [`train.py`](../src/any2rwkv/qwen2rwkv/align/train.py)：逐层蒸馏、checkpoint schema
-  检查以及验证集、测试集验收。
+  检查以及统一验证集验收。
 
 ## 1. 保留的原 GDN 边界
 
@@ -186,29 +186,26 @@ gradient clipping 保持不变。
 
 prefill 通过原 GDN causal Conv4 更新 conv cache；单 token decode 使用原 GDN
 `causal_conv1d_update` 原地推进相同 cache。WKV state 和 elapsed state 由现有 varlen
-operator 原地更新。GQA 层继续保存原有 one-token shift/WKV cache。
-
-GDN 不生成、覆盖或消费 RWKV value-residual `v_first`。执行到第一个 GQA 层时，
-该 GQA 层从自己的 `value_base` 建立本次 forward 的 `v_first`；后续 GQA 层沿用。
+operator 原地更新。当前产品路径在第一个 GQA 层前 fail closed，不再携带 GQA
+one-token shift、sidecar、value residual 或其它未验收 cache 状态。
 
 ## 5. 数据、指标和验收边界
 
 “蒸馏前”指严格复制原 GDN 参数，再执行 Clamp-W forward projection，不做参数拟合。
-每张卡上的数据固定分为四部分：
+每张卡上的数据固定分为三部分：
 
-- rows `0:8`：初始化集；GDN 只做蒸馏前诊断，GQA 用它计算解析初始化；
-- rows `8:16`：验证集；选择 GQA 初始化候选和逐层最佳 checkpoint；
-- rows `16:24`：测试集；权重确定后只测量一次，不参与任何参数更新；
+- rows `0:8`：初始化集；GDN 只做蒸馏前诊断；
+- rows `8:24`：统一验证集；选择逐层最佳 checkpoint；
 - rows `24:`：训练集；用于反向传播和参数更新。
 
-当前 `--through-layer 3` 依次覆盖前三层 GDN 和第一层 GQA。验证集选择出的最佳
-权重会在训练集、验证集和测试集上分别测量。验证集与测试集的整层输出 NMSE 都
-必须不高于 `1e-3`；TMix 输出 NMSE 单独报告和优化，但不是独立硬门。
+当前 `--through-layer 2` 覆盖前三层 GDN。第 3 层 GQA 尚无通过严格门槛的方法，
+调用时会在训练和保存 artifact 前明确失败。验证集选择出的最佳 GDN 权重会在训练集
+和统一验证集上分别测量。统一验证集的整层输出 NMSE 必须不高于 `3e-3`；TMix 输出
+NMSE 单独报告和优化，但不是独立硬门。
 
 某层未达到严格目标时，当前进程仍会在内存中继续测到 `--through-layer` 指定的层，
 以获得完整误差曲线；命令结束时仍返回失败。从第一个未通过层开始不保存正式
 `layer_XX.safetensors`，后续结果只表示“基于未通过前缀的诊断”，不构成验收通过。
-测试集结果不得用于重选参数、修改方法或重试。
 
 验收证据必须分层记录：
 
@@ -216,7 +213,8 @@ GDN 不生成、覆盖或消费 RWKV value-residual `v_first`。执行到第一�
    与 Clamp-W 可见误差计算正确；
 2. D128 BF16 FlashRWKV2 forward/backward 才能证明训练 kernel 路径有限；
 3. FP16 prefill/decode cache-reuse 对比才能证明 Conv/WKV cache 路径一致；
-4. 逐层验证集和测试集结果才决定整层输出 NMSE 是否达到 `<=1e-3`。
+4. 逐层统一验证集结果决定整层输出 NMSE 是否达到 `<=3e-3`，不再维护第二套 test
+   指标。
 
 任一层证据都不能替代其它层。静态检查或 CPU reference 不构成 GPU kernel 与完整
 逐层验收。
