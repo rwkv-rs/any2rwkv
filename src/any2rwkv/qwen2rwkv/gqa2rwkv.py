@@ -1,10 +1,4 @@
-"""Hedgehog/LoLCATs initialization and exact GQA teachers.
-
-The product recurrence and bounded sidecar live in modeling_qwen2rwkv so
-training, reference evaluation, and inference share one implementation. This
-module only owns source-attention extraction and the fail-closed layer-3
-initializer.
-"""
+"""Pure RWKV feature-state initialization and frozen GQA teacher extraction."""
 
 from __future__ import annotations
 
@@ -12,9 +6,6 @@ import math
 
 import torch
 from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
-
-REFERENCE_NMSE_GATE = 1e-6
-ORACLE_BLOCK_NMSE_GATE = 1.5e-3
 
 
 def _nmse(actual: torch.Tensor, wanted: torch.Tensor) -> float:
@@ -69,15 +60,6 @@ def exact_gqa_attention(
 
 
 @torch.no_grad()
-def exact_gqa_teacher_targets(
-    source,
-    hidden: torch.Tensor,
-    position_embeddings: tuple[torch.Tensor, torch.Tensor],
-) -> torch.Tensor:
-    return exact_gqa_attention(source, hidden, position_embeddings)
-
-
-@torch.no_grad()
 def _source_tmix_output(
     source,
     hidden: torch.Tensor,
@@ -101,15 +83,8 @@ def initialize_gqa_layer(
     target,
     init_hidden: torch.Tensor,
     init_position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    validation_hidden: torch.Tensor | None = None,
-    validation_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> dict[str, float]:
-    """Install the source shell and verify exact-prefix identity.
-
-    Capacity, feature dimension, and readout form are fixed by the target
-    checkpoint schema. No validation-driven architecture selection happens
-    here.
-    """
+    """Install source projections and report the pure feature-state baseline."""
 
     if (
         target.num_heads != 8
@@ -118,56 +93,103 @@ def initialize_gqa_layer(
         or target.feature_projection_dim != 64
         or target.feature_output_dim != 128
         or target.states_per_head != 2
-        or target.sidecar_capacity != 128
-        or (target.sink_slots, target.recent_slots, target.heavy_slots) != (8, 64, 56)
     ):
-        raise ValueError(
-            "GQA initialization requires fixed [QH8,KVH2,D256,F64x2,S2,sidecar=8+64+56] geometry"
-        )
+        raise ValueError("GQA initialization requires fixed [QH8,KVH2,D256,F64x2,S2] geometry")
     target.load_source_attention(source)
-
-    # A prefix no longer than the sidecar is an exact-attention identity. Use
-    # one row to keep initializer memory independent of DDP world size.
-    prefix_length = min(128, init_hidden.shape[1])
-    probe_hidden = init_hidden[:1, :prefix_length]
-    probe_embeddings = tuple(value[:1, :prefix_length] for value in init_position_embeddings)
-    source_heads = exact_gqa_attention(source, probe_hidden, probe_embeddings)
-    target_heads, _ = target.attention_heads_reference(
-        probe_hidden,
-        torch.arange(prefix_length, device=probe_hidden.device).view(1, -1),
-    )
-    attention_nmse = _nmse(target_heads.transpose(1, 2), source_heads)
+    probe_length = min(128, init_hidden.shape[1])
+    probe_hidden = init_hidden[:1, :probe_length]
+    probe_embeddings = tuple(value[:1, :probe_length] for value in init_position_embeddings)
     source_output = _source_tmix_output(source, probe_hidden, probe_embeddings)
     target_output = target.reference_forward(probe_hidden)
     tmix_nmse = _nmse(target_output, source_output)
-    if (
-        not math.isfinite(attention_nmse)
-        or not math.isfinite(tmix_nmse)
-        or attention_nmse > REFERENCE_NMSE_GATE
-        or tmix_nmse > REFERENCE_NMSE_GATE
-    ):
-        raise RuntimeError(
-            "bounded Hedgehog exact-prefix identity failed: "
-            f"attention_nmse={attention_nmse:.8g}, tmix_nmse={tmix_nmse:.8g}"
-        )
-
-    sidecar_bytes = target.sidecar_capacity * target.num_kv_heads * target.head_size * 2 * 2
+    if not math.isfinite(tmix_nmse):
+        raise RuntimeError(f"pure RWKV GQA initialization produced non-finite NMSE {tmix_nmse}")
     recurrent_bytes = target.kernel_heads * target.head_size * target.head_size * 2
     return {
-        "hedgehog_exact_prefix_attention_nmse": attention_nmse,
-        "hedgehog_exact_prefix_tmix_nmse": tmix_nmse,
+        "rwkv_feature_state_init_tmix_nmse": tmix_nmse,
         "gqa_feature_projection_dim": float(target.feature_projection_dim),
         "gqa_feature_output_dim": float(target.feature_output_dim),
-        "gqa_sidecar_slots": float(target.sidecar_capacity),
-        "gqa_sidecar_kv_bytes_fp16": float(sidecar_bytes),
         "gqa_recurrent_bytes_fp16": float(recurrent_bytes),
-        "gqa_total_fixed_payload_bytes_fp16": float(sidecar_bytes + recurrent_bytes),
     }
 
 
+@torch.no_grad()
+def evaluate_gqa_recall(target, distances=(128, 256, 512, 1024), *, use_flash=False):
+    """Recall a value against repeated distractors through the actual feature maps.
+
+    The deterministic logits use a right-inverse of each current Q/K feature
+    matrix. This keeps the fixture in feature space when shell weights are
+    fine-tuned and tests the recurrent kernel rather than a parameterization.
+    """
+    weight = target.feature_q_weight
+    batch, heads, kv_heads, width = 2, target.num_heads, target.num_kv_heads, target.head_size
+    codes = torch.tensor([[3, 11], [19, 27]], device=weight.device)
+    metrics = {}
+    for distance in distances:
+        length = distance + 16
+        positions = torch.arange(length, device=weight.device)
+        distractors = (
+            codes[..., None] + 1 + positions.remainder(31)
+        ) % target.feature_projection_dim
+        distractors[:, :, 15] = codes
+        query_logits = torch.zeros(
+            batch, heads, length, target.feature_projection_dim, device=weight.device
+        )
+        query_codes = codes[:, :, None, None].expand(batch, kv_heads, length, 1)
+        query_codes = query_codes.repeat_interleave(heads // kv_heads, dim=1)
+        query_logits.scatter_(-1, query_codes, 10.0)
+        key_distractors = distractors.repeat_interleave(heads // kv_heads, dim=1)
+        key_logits = torch.zeros(
+            batch, heads, length, target.feature_projection_dim, device=weight.device
+        )
+        key_logits.scatter_(-1, key_distractors[..., None], 10.0)
+
+        def right_inverse(logits, matrix):
+            logits_batch, logits_heads, logits_length, logits_width = logits.shape
+            outputs = []
+            for head in range(matrix.shape[0]):
+                flat = logits[:, head].reshape(-1, logits.shape[-1]).T
+                # ``pinv`` gives the minimum-norm right-inverse for the
+                # rectangular [F,D] system and remains deterministic across
+                # CPU BLAS implementations (``lstsq`` may return a different
+                # null-space solution for the same rank-deficient matrix).
+                inverse = torch.linalg.pinv(matrix[head].float().T, rcond=1e-5)
+                solution = (inverse @ flat).T
+                outputs.append(solution.reshape(logits_batch, logits_length, width))
+            return torch.stack(outputs, dim=1).to(weight.dtype)
+
+        query = right_inverse(query_logits, target.feature_q_weight)
+        key = right_inverse(key_logits, target.feature_k_weight)
+        values = torch.zeros(batch, heads, length, width, device=weight.device, dtype=weight.dtype)
+        values[..., 1] = 1
+        values[:, :, 15, 1] = 0
+        values[:, :, 15, 0] = 1
+        # ``key`` is constructed per repeated query head so every learned
+        # feature matrix is exercised directly.  Runtime GQA repeats the
+        # source K/V before applying the per-head feature map; doing that
+        # explicit repeat here would make a right-inverse impossible once K
+        # feature matrices have diverged during distillation.
+        feature_query = target._feature(query, target.feature_q_weight)
+        feature_key = target._feature(key, target.feature_k_weight)
+        recurrence = target._state_training if use_flash else target._state_reference
+        numerator, denominator = recurrence(feature_query, feature_key, values)
+        recalled = numerator[:, :, -1] / denominator[:, :, -1, None].clamp_min(1e-12)
+        metrics[f"recall_{distance}_hit_at_1"] = float((recalled.argmax(-1) == 0).float().mean())
+        # The frozen source teacher is represented by the synthetic logits
+        # themselves, so its hit remains an oracle even when the student
+        # feature matrices are deliberately collapsed in the negative test.
+        teacher_scores = torch.einsum(
+            "bhf,bhtf->bht", query_logits[:, :, -1].float(), key_logits.float()
+        )
+        exact = torch.einsum("bht,bhtd->bhd", teacher_scores.softmax(-1), values.float())
+        metrics[f"teacher_recall_{distance}_hit_at_1"] = float(
+            (exact.argmax(-1) == 0).float().mean()
+        )
+    return metrics
+
+
 __all__ = [
-    "ORACLE_BLOCK_NMSE_GATE",
+    "evaluate_gqa_recall",
     "exact_gqa_attention",
-    "exact_gqa_teacher_targets",
     "initialize_gqa_layer",
 ]

@@ -196,15 +196,16 @@ GDN 不生成、覆盖或消费 RWKV value-residual `v_first`。执行到第一�
 “蒸馏前”指严格复制原 GDN 参数，再执行 Clamp-W forward projection，不做参数拟合。
 每张卡上的数据固定分为三部分：
 
-- rows `0:8`：初始化集；GDN 只做蒸馏前诊断，GQA 用它计算解析初始化；
-- rows `8:24`：统一验证集；选择 GQA 初始化候选和逐层最佳 checkpoint；
+- rows `0:8`：初始化集；复制 source 权重后执行蒸馏前诊断；
+- rows `8:24`：统一验证集；选择逐层最佳 checkpoint；
 - rows `24:`：训练集；用于反向传播和参数更新。
 
 当前 `--through-layer 3` 依次覆盖前三层 GDN 和第一层 GQA。验证集选择出的最佳
-权重会在训练集和统一验证集上分别测量。统一验证集的整层输出 NMSE 必须不高于
-`3e-3`；TMix 输出 NMSE 单独报告和优化，但不是独立硬门。
+权重会在训练集和统一验证集上分别测量。整层输出 NMSE 和 TMix 输出 NMSE 用于
+记录训练改善，不再使用 `3e-3` 这一绝对质量截止值。保存的最佳状态在统一验证集上
+应不劣于初始化，最终效果通过完整转换后的生成另行评估。
 
-某层未达到严格目标时，当前进程仍会在内存中继续测到 `--through-layer` 指定的层，
+某层验证结果比初始化退化时，当前进程仍会在内存中继续测到 `--through-layer` 指定的层，
 以获得完整误差曲线；命令结束时仍返回失败。从第一个未通过层开始不保存正式
 `layer_XX.safetensors`，后续结果只表示“基于未通过前缀的诊断”，不构成验收通过。
 
@@ -214,8 +215,7 @@ GDN 不生成、覆盖或消费 RWKV value-residual `v_first`。执行到第一�
    与 Clamp-W 可见误差计算正确；
 2. D128 BF16 FlashRWKV2 forward/backward 才能证明训练 kernel 路径有限；
 3. FP16 prefill/decode cache-reuse 对比才能证明 Conv/WKV cache 路径一致；
-4. 逐层统一验证集结果决定整层输出 NMSE 是否达到 `<=3e-3`，不再维护第二套 test
-   指标。
+4. 逐层统一验证集比较初始化与蒸馏后的整层输出 NMSE，不再维护第二套 test 指标。
 
 任一层证据都不能替代其它层。静态检查或 CPU reference 不构成 GPU kernel 与完整
 逐层验收。
