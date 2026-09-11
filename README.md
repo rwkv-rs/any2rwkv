@@ -33,6 +33,10 @@ The selected conservative 12-epoch candidate reaches Block NMSE `0.02949` with
 hit@1 `1.0` at all four tested distances. A longer candidate reached `0.02573` but
 was rejected after its full-model math generation regressed. Model generation is
 evaluated separately, including whether answers finish with an EOS token.
+The directory-level warm-start path has now completed all 24 layers: six GQA layers
+passed gate-zero recall, global KL fell from `0.219678` to `0.183399`, and the three
+fixed generation prompts all finished with EOS. This is a smoke test rather than a
+full language evaluation.
 See [the GQA migration analysis and acceptance evidence](docs/gqa2rwkv.md).
 
 The product path requires the pinned `rwkv-rs/transformers-rwkv` revision and

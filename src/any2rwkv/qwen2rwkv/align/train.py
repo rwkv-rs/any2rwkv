@@ -295,6 +295,19 @@ def _load_gqa_initial_checkpoint(tmix, path: Path) -> None:
     tmix.load_state_dict(state, strict=True)
 
 
+def _warm_start_checkpoint(path, layer_idx: int) -> Path | None:
+    if path is None:
+        return None
+    candidate = Path(path)
+    if candidate.is_dir():
+        candidate = candidate / f"layer_{layer_idx:02d}.safetensors"
+    elif layer_idx != 3:
+        return None
+    if not candidate.is_file():
+        raise FileNotFoundError(f"missing warm-start layer checkpoint: {candidate}")
+    return candidate
+
+
 def _load_layer_checkpoint(output: Path, layer_idx: int, tmix) -> None:
     path = output / f"layer_{layer_idx:02d}.safetensors"
     state = load_file(path.as_posix())
@@ -1016,19 +1029,24 @@ def _layerwise(
         train_hidden = hidden_cache[24:]
         init_hidden = _gather_init_hidden(init_local, world)
         validation_for_init = _gather_init_hidden(validation_local, world)
+        is_gdn = student.config.source_layer_types[index] == "linear_attention"
+        warm_start = _warm_start_checkpoint(gqa_initial_checkpoint, index)
         metrics = (
             _initialize_layer(source_text, student, index, init_hidden, validation_for_init)
-            if rank == 0
+            if rank == 0 and warm_start is None
             else {}
         )
-        if rank == 0 and index == 3 and gqa_initial_checkpoint is not None:
-            _load_gqa_initial_checkpoint(
-                student.model.layers[index].tmix, Path(gqa_initial_checkpoint)
-            )
+        if rank == 0 and warm_start is not None:
+            if is_gdn:
+                _load_layer_checkpoint(warm_start.parent, index, student.model.layers[index].tmix)
+            else:
+                _load_gqa_initial_checkpoint(student.model.layers[index].tmix, warm_start)
             print(
                 {
                     "stage": "gqa_initial_checkpoint",
-                    "path": str(gqa_initial_checkpoint),
+                    "path": str(warm_start),
+                    "layer": index,
+                    "warm_start_mode": "full_layer" if is_gdn else "transferred_gqa",
                     "train_dynamics": gqa_train_dynamics,
                     "epochs_per_gate": gqa_epochs,
                     "learning_rate": gqa_learning_rate,
@@ -1046,7 +1064,13 @@ def _layerwise(
         tmix = student.model.layers[index].tmix
         tmix.requires_grad_(True)
         layer = student.model.layers[index].to(device).train()
-        is_gdn = student.config.source_layer_types[index] == "linear_attention"
+        if is_gdn and warm_start is not None:
+            if rank == 0:
+                _save_layer(output, index, tmix)
+            if world > 1:
+                dist.barrier()
+            _cache_layer(layer, hidden_cache, first_cache, cache, device)
+            continue
         if not is_gdn:
             result = _align_gqa_layer(
                 source_text,
@@ -1059,7 +1083,7 @@ def _layerwise(
                 cache=cache,
                 hidden_cache=hidden_cache,
                 v_first=first_cache,
-                skip_transfer=index == 3 and gqa_initial_checkpoint is not None,
+                skip_transfer=warm_start is not None,
                 epochs=gqa_epochs,
                 learning_rate=gqa_learning_rate,
                 train_dynamics=gqa_train_dynamics,
@@ -1659,7 +1683,10 @@ def main():
     parser.add_argument("--global-kl-only", action="store_true")
     parser.add_argument("--through-layer", type=int, default=23)
     parser.add_argument("--gqa-prefix-cache")
-    parser.add_argument("--gqa-initial-checkpoint")
+    parser.add_argument(
+        "--gqa-initial-checkpoint",
+        help="layer-3 initialization file or a complete directory of layer checkpoints",
+    )
     parser.add_argument(
         "--gqa-epochs",
         type=int,

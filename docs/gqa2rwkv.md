@@ -132,6 +132,10 @@ uv run python -m any2rwkv.qwen2rwkv.align.train \
 `--gqa-epochs 0` 可重放候选的验收。旧 hidden-only prefix cache 缺少 `v_first`，
 需要从前三层 checkpoint 重建；标准 `--through-layer 3` 流程会自动重建。
 
+完整模型复用 v2 的所有 layer checkpoint 时，将 `--gqa-initial-checkpoint` 指向
+该目录。GDN layer 会严格加载并只重建后续 cache；每个 GQA layer 则只接收其
+source Q/K/V/O、norm 和 feature 权重，新增 RWKV 参数仍按中性初始化展开。
+
 ## Schema 与验收边界
 
 当前 schema 为 `gqa_rwkv_tmix_d256x2_v3`；feature geometry 仍为 D256→F64→F128，
@@ -148,7 +152,8 @@ artifact。只有显式的训练初始化入口接受完整 v2 layer 权重，�
   经过 source Q/K/V/O。独立固定随机 hidden 驱动已学习的 decay、erase、value
   residual，读出包含归一化和 RKV shortcut。负例检查 feature collapse 和过强
   learned decay，防止在测试中绕过已学习的遗忘机制。
-- **整模型生成**：需单独验证，不由 Block NMSE 或上述合成 recall 推断。
+- **整模型生成**：必须单独验证，不能由 Block NMSE 或上述合成 recall 推断；本次
+  24-layer run 已完成该检查。
 
 ## 实验证据
 
@@ -176,11 +181,18 @@ smoke test 中，保守候选的中文解释和二次方程回答均正常结束
 候选均没有 teacher、sidecar 或临时 gate 参数。该 smoke test 只证明运行和回答
 结束，不替代语言质量评测。
 
-当前保守候选的完整模型 graft 产物为
+完整 24-layer v3 run 使用同一目录级 v2 warm-start，6 个 GQA layer 均完成 gate=0
+验收，四距 recall 全部为 `1.0`。最终模型位于
+`/home/caizus/Weights/Qwen/Qwen3.5-2B-rwkv-tmix-v3-full-20260911`，包含 24 个
+纯 RWKV layer checkpoint 和约 3.77 GB 的 `model.safetensors`；global KL 三个
+epoch 为 `0.219678 → 0.192705 → 0.183399`。三条生成分别为 73、394、440 token，
+均以 EOS 结束；中文解释、二次方程答案（`x=2,x=3`）和 Fibonacci 列表均可读。
+这是一次固定提示的 generation smoke test，不替代完整语言评测。
+
+layer-3 保守候选的完整模型 graft 产物仍保留在
 `/home/caizus/Weights/Qwen/Qwen3.5-2B-rwkv-tmix-generation-20260911/retention`；
 其中 `experiment.json` 记录了 v2 全模型基线、layer-3 checkpoint SHA-256 和
-中性 v3 扩展方式。该目录用于生成复核，正式完整 24-layer v3 转换仍需在所有
-GQA 层逐层蒸馏后单独运行。
+中性 v3 扩展方式，可用于复核 layer-3 生成差异。
 
 历史 v2 完整模型位于
 `/home/caizus/Weights/Qwen/Qwen3.5-2B-pure-rwkv-common-20260911`，其三轮 global KL
