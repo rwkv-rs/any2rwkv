@@ -188,8 +188,9 @@ prefill 通过原 GDN causal Conv4 更新 conv cache；单 token decode 使用�
 `causal_conv1d_update` 原地推进相同 cache。WKV state 和 elapsed state 由现有 varlen
 operator 原地更新。GQA 层继续保存原有 one-token shift/WKV cache。
 
-GDN 不生成、覆盖或消费 RWKV value-residual `v_first`。执行到第一个 GQA 层时，
-该 GQA 层从自己的 `value_base` 建立本次 forward 的 `v_first`；后续 GQA 层沿用。
+首层 GDN 从卷积后的原始 value 建立当前 token 的 `v_first`，后续层沿用；GDN
+自身不消费 value residual，GQA 的可学习 value residual 使用它。逐层 hidden cache
+同时保存对应的首层 value，保证逐层蒸馏与完整模型 forward 使用相同输入。
 
 ## 5. 数据、指标和验收边界
 

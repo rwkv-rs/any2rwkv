@@ -39,6 +39,8 @@ PROMPTS = (
 )
 VALIDATION_TMIX_PATIENCE = 5
 GQA_PACKED_SHA256 = "1d039b73dcafd9783a7e872f682cf64728cb31f6090ef54c2882ca3bc0919336"
+# Retention fractions have a much larger effect per unit than projection weights.
+GQA_DECAY_LR_SCALE = 0.02
 
 
 def _distributed():
@@ -95,12 +97,12 @@ def _teacher_tmix_output(source_text, layer_idx, hidden):
     )[0]
 
 
-def _student_tmix_output(student, layer_idx, hidden):
+def _student_tmix_output(student, layer_idx, hidden, v_first=None):
     layer = student.model.layers[layer_idx]
     normalized = layer.input_layernorm(hidden)
     return layer.tmix(
         normalized,
-        None,
+        v_first,
         None,
         torch.ones(hidden.shape[:2], dtype=torch.bool, device=hidden.device),
     )[0]
@@ -177,15 +179,22 @@ def _require_finite_metrics(metrics: dict[str, float], layer_idx: int, split: st
             raise FloatingPointError(f"non-finite layer {layer_idx} {split} metric {name}: {value}")
 
 
+def _hidden_batches(hidden, v_first=None):
+    for start in range(0, len(hidden), 8):
+        yield hidden[start : start + 8], None if v_first is None else v_first[start : start + 8]
+
+
 @torch.no_grad()
-def _evaluate_layer(source_text, student, layer_idx, hidden, world, device):
+def _evaluate_layer(source_text, student, layer_idx, hidden, world, device, v_first=None):
     totals = torch.zeros(8, dtype=torch.float64, device=device)
     layer = student.model.layers[layer_idx]
     layer.train()
-    for batch in hidden.split(8):
+    for batch, first in _hidden_batches(hidden, v_first):
         batch = batch.to(device)
         wanted_tmix = _teacher_tmix_output(source_text, layer_idx, batch).float()
-        actual_tmix = _student_tmix_output(student, layer_idx, batch).float()
+        actual_tmix = _student_tmix_output(
+            student, layer_idx, batch, None if first is None else first.to(device)
+        ).float()
         source_layer = source_text.layers[layer_idx]
         wanted_residual = batch + wanted_tmix.to(batch)
         wanted_layer = (
@@ -248,7 +257,10 @@ def _require_gqa_packed_provenance(path: Path) -> None:
 def _save_layer(output: Path, layer_idx: int, tmix) -> None:
     _assert_pure_rwkv_state(tmix)
     tensors = {name: value.detach().cpu().contiguous() for name, value in tmix.state_dict().items()}
-    save_file(tensors, (output / f"layer_{layer_idx:02d}.safetensors").as_posix())
+    path = output / f"layer_{layer_idx:02d}.safetensors"
+    pending = path.with_suffix(".pending")
+    save_file(tensors, pending.as_posix())
+    pending.replace(path)
 
 
 def _assert_pure_rwkv_state(module) -> None:
@@ -257,6 +269,30 @@ def _assert_pure_rwkv_state(module) -> None:
     leaked = [name for name in names if any(token in name for token in forbidden)]
     if leaked:
         raise RuntimeError(f"pure RWKV checkpoint contains temporary parameters: {leaked}")
+
+
+def _gqa_transferred_names(tmix):
+    prefixes = (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "q_norm",
+        "k_norm",
+        "feature_q_weight",
+        "feature_k_weight",
+    )
+    return {name for name in tmix.state_dict() if name.split(".")[0] in prefixes}
+
+
+def _load_gqa_initial_checkpoint(tmix, path: Path) -> None:
+    """Explicit training-time expansion of a v2 layer; runtime loading stays strict."""
+    saved = load_file(path.as_posix())
+    state = tmix.state_dict()
+    if set(saved) not in (set(state), _gqa_transferred_names(tmix)):
+        raise ValueError("GQA initialization must be a complete v2 or v3 layer checkpoint")
+    state.update(saved)
+    tmix.load_state_dict(state, strict=True)
 
 
 def _load_layer_checkpoint(output: Path, layer_idx: int, tmix) -> None:
@@ -275,27 +311,27 @@ def _load_layer_checkpoint(output: Path, layer_idx: int, tmix) -> None:
     tmix.load_state_dict(state, strict=True)
 
 
+@torch.no_grad()
+def _cache_layer(layer, hidden, v_first, cache, device):
+    outputs, first_values = [], []
+    for batch, first in _hidden_batches(hidden, v_first):
+        output, first = layer(batch.to(device), None if first is None else first.to(device))
+        outputs.append(output.cpu())
+        first_values.append(first.cpu())
+    cache.store(torch.cat(outputs), v_first=torch.cat(first_values))
+    cache.advance()
+
+
 def _rebuild_cache(student, ids, cache: LastLayerCache, completed: int, device):
-    chunks = []
     with torch.no_grad():
-        for batch in ids.split(8):
-            chunks.append(student.model.embed_tokens(batch.to(device)).cpu())
-    cache.store(torch.cat(chunks), "next")
+        hidden = torch.cat(
+            [student.model.embed_tokens(batch.to(device)).cpu() for batch in ids.split(8)]
+        )
+    cache.store(hidden)
     cache.advance()
     for index in range(completed):
         layer = student.model.layers[index].to(device).train()
-        chunks = []
-        with torch.no_grad():
-            for hidden in cache.load().split(8):
-                output, _ = layer(
-                    hidden.to(device),
-                    None,
-                    None,
-                    torch.ones(hidden.shape[:2], dtype=torch.bool, device=device),
-                )
-                chunks.append(output.cpu())
-        cache.store(torch.cat(chunks), "next")
-        cache.advance()
+        _cache_layer(layer, cache.load(), cache.load_v_first(), cache, device)
 
 
 class _LayerObjective(nn.Module):
@@ -303,11 +339,11 @@ class _LayerObjective(nn.Module):
         super().__init__()
         self.layer = layer
 
-    def forward(self, hidden, teacher_tmix=None, gate=0.0):
+    def forward(self, hidden, teacher_tmix=None, gate=0.0, v_first=None):
         normalized = self.layer.input_layernorm(hidden)
         tmix_output, _ = self.layer.tmix(
             normalized,
-            None,
+            v_first,
             None,
             torch.ones(hidden.shape[:2], dtype=torch.bool, device=hidden.device),
         )
@@ -320,11 +356,11 @@ class _LayerObjective(nn.Module):
 
 
 @torch.no_grad()
-def _evaluate_gqa_reference(source_text, student, layer_idx, hidden, world, device):
+def _evaluate_gqa_reference(source_text, student, layer_idx, hidden, world, device, v_first=None):
     target_layer = student.model.layers[layer_idx]
     reference_layer = copy.deepcopy(target_layer).to(device=device, dtype=torch.float32).eval()
     totals = torch.zeros(6, dtype=torch.float64, device=device)
-    for batch in hidden.split(8):
+    for batch, first in _hidden_batches(hidden, v_first):
         batch = batch.to(device)
         wanted_tmix = _teacher_tmix_output(source_text, layer_idx, batch)
         source_layer = source_text.layers[layer_idx]
@@ -334,13 +370,16 @@ def _evaluate_gqa_reference(source_text, student, layer_idx, hidden, world, devi
         )
         reference_batch = batch.float()
         reference_tmix = reference_layer.tmix.reference_forward(
-            reference_layer.input_layernorm(reference_batch)
+            reference_layer.input_layernorm(reference_batch),
+            v_first=None if first is None else first.to(device=device, dtype=torch.float32),
         )
         reference_residual = reference_batch + reference_tmix
         reference_block = reference_residual + reference_layer.mlp(
             reference_layer.post_attention_layernorm(reference_residual)
         )
-        native_tmix = _student_tmix_output(student, layer_idx, batch)
+        native_tmix = _student_tmix_output(
+            student, layer_idx, batch, None if first is None else first.to(device)
+        )
         native_residual = batch + native_tmix
         native_block = native_residual + target_layer.mlp(
             target_layer.post_attention_layernorm(native_residual)
@@ -361,7 +400,7 @@ def _evaluate_gqa_reference(source_text, student, layer_idx, hidden, world, devi
 
 
 @torch.no_grad()
-def _fp16_forward_mode(layer, hidden, config, chunk_size, cache=None):
+def _fp16_forward_mode(layer, hidden, config, chunk_size, cache=None, v_first=None):
     from ..transformers.modeling_qwen2rwkv import Qwen2RWKVCache
 
     cache = Qwen2RWKVCache(config) if cache is None else cache
@@ -374,7 +413,7 @@ def _fp16_forward_mode(layer, hidden, config, chunk_size, cache=None):
         normalized = layer.input_layernorm(chunk)
         tmix_output, _ = layer.tmix(
             normalized,
-            None,
+            None if v_first is None else v_first[:, start : start + chunk_size],
             cache,
             torch.ones(chunk.shape[:2], dtype=torch.bool, device=chunk.device),
         )
@@ -446,15 +485,20 @@ def _gqa_cache_resource_metrics(cache, layer_idx: int) -> dict[str, float]:
     )
     if recurrent_bytes != 2 * 1024 * 1024:
         raise RuntimeError(f"pure RWKV persistent state changed: recurrent={recurrent_bytes}")
+    shift = layer.conv_states[0]
+    shift_bytes = shift.numel() * shift.element_size() // batch
     return {
+        "token_shift_bytes_per_sequence": float(shift_bytes),
         "recurrent_bytes_per_sequence": float(recurrent_bytes),
         "control_bytes_per_sequence": float(control_bytes),
-        "total_fixed_state_bytes_per_sequence": float(recurrent_bytes + control_bytes),
+        "total_fixed_state_bytes_per_sequence": float(
+            recurrent_bytes + shift_bytes + control_bytes
+        ),
     }
 
 
 @torch.no_grad()
-def _gqa_fp16_soak(layer, seed_hidden, config) -> dict[str, float]:
+def _gqa_fp16_soak(layer, seed_hidden, config, v_first=None) -> dict[str, float]:
     from ..transformers.modeling_qwen2rwkv import Qwen2RWKVCache
 
     cache = Qwen2RWKVCache(config)
@@ -465,7 +509,7 @@ def _gqa_fp16_soak(layer, seed_hidden, config) -> dict[str, float]:
         hidden = seed_hidden.expand(1, length, -1).contiguous()
         output, _ = layer.tmix(
             layer.input_layernorm(hidden),
-            None,
+            None if v_first is None else v_first.expand(1, length, -1).contiguous(),
             cache,
             torch.ones(1, length, dtype=torch.bool, device=hidden.device),
         )
@@ -483,22 +527,25 @@ def _gqa_fp16_soak(layer, seed_hidden, config) -> dict[str, float]:
 
 
 @torch.no_grad()
-def _evaluate_gqa_fp16_cache(student, layer_idx, hidden, rank, world, device):
+def _evaluate_gqa_fp16_cache(student, layer_idx, hidden, rank, world, device, v_first=None):
     source_layer = student.model.layers[layer_idx]
     runtime_layer = copy.deepcopy(source_layer).to(device=device, dtype=torch.float16).eval()
     names = ("chunk64", "chunk128", "chunk256", "decode")
     totals = torch.zeros(len(names), 2, 2, dtype=torch.float64, device=device)
-    first_batch = None
-    for batch in hidden.split(8):
+    first_batch = first_value = None
+    for batch, first in _hidden_batches(hidden, v_first):
         batch = batch.to(device=device, dtype=torch.float16)
+        first = None if first is None else first.to(device=device, dtype=torch.float16)
         if first_batch is None:
-            first_batch = batch
+            first_batch, first_value = batch, first
         full_tmix, full_block, cache = _fp16_forward_mode(
-            runtime_layer, batch, student.config, None
+            runtime_layer, batch, student.config, None, v_first=first
         )
         _gqa_cache_resource_metrics(cache, layer_idx)
         for index, chunk_size in enumerate((64, 128, 256, 1)):
-            tmix, block, _ = _fp16_forward_mode(runtime_layer, batch, student.config, chunk_size)
+            tmix, block, _ = _fp16_forward_mode(
+                runtime_layer, batch, student.config, chunk_size, v_first=first
+            )
             for output_idx, (actual, wanted) in enumerate(((tmix, full_tmix), (block, full_block))):
                 totals[index, output_idx, 0] += (
                     (actual.float() - wanted.float()).double().square().sum()
@@ -519,7 +566,12 @@ def _evaluate_gqa_fp16_cache(student, layer_idx, hidden, rank, world, device):
     if rank == 0:
         try:
             _fresh_process_gqa_strict_load(student.config, layer_idx, runtime_layer.tmix)
-            outcome[0] = _gqa_fp16_soak(runtime_layer, first_batch[:1, :1], student.config)
+            outcome[0] = _gqa_fp16_soak(
+                runtime_layer,
+                first_batch[:1, :1],
+                student.config,
+                None if first_value is None else first_value[:1, :1],
+            )
         except Exception as error:
             outcome[0] = str(error)
     if world > 1:
@@ -552,19 +604,23 @@ def _nmse_loss(actual: torch.Tensor, wanted: torch.Tensor) -> torch.Tensor:
 
 
 GQA_GATE_SCHEDULE = (0.9, 0.75, 0.5, 0.25, 0.1, 0.0)
-GQA_RUNTIME_RELATIVE_L2_LIMIT = 1.1e-3
+GQA_RUNTIME_RELATIVE_L2_LIMIT = 1e-3
 
 
 @torch.no_grad()
-def _refresh_gqa_stage_cache(source_text, student, layer_idx, hidden_cache, cache, device, gate):
+def _refresh_gqa_stage_cache(
+    source_text, student, layer_idx, hidden_cache, cache, device, gate, v_first=None
+):
     objective = _LayerObjective(student.model.layers[layer_idx])
     chunks = []
-    for hidden in hidden_cache.split(8):
+    for hidden, first in _hidden_batches(hidden_cache, v_first):
         hidden = hidden.to(device)
         teacher = _teacher_tmix_output(source_text, layer_idx, hidden) if gate else None
-        chunks.append(objective(hidden, teacher, gate)[0].cpu())
+        chunks.append(
+            objective(hidden, teacher, gate, None if first is None else first.to(device))[0].cpu()
+        )
     # Keep the fixed prefix input in `current`; only gate=0 may advance `next`.
-    cache.store(torch.cat(chunks), "next")
+    cache.store(torch.cat(chunks), "next", v_first=v_first)
 
 
 def _require_gqa_acceptance(native, reference, recall, layer_idx):
@@ -596,6 +652,9 @@ def _run_gqa_phase(
     patience: int,
     lr: float,
     weight_decay: float,
+    train_v_first=None,
+    validation_v_first=None,
+    train_dynamics=True,
 ):
     layer = student.model.layers[layer_idx]
     tmix = layer.tmix
@@ -603,7 +662,12 @@ def _run_gqa_phase(
     if phase == "attention_transfer":
         parameters = tmix.attention_transfer_parameters()
     elif phase == "distillation":
-        parameters = list(tmix.parameters())
+        transferred = _gqa_transferred_names(tmix)
+        parameters = [
+            parameter
+            for name, parameter in tmix.named_parameters()
+            if train_dynamics or name in transferred
+        ]
     else:
         raise ValueError(f"unknown GQA alignment phase {phase!r}")
     for parameter in parameters:
@@ -611,28 +675,51 @@ def _run_gqa_phase(
     wrapper = tmix
     if world > 1:
         wrapper = DistributedDataParallel(wrapper, device_ids=[device.index])
-    loader = DataLoader(TensorDataset(train_hidden), batch_size=8, shuffle=False)
+    steps_per_epoch = math.ceil(len(train_hidden) / 8)
     master_parameters = [
         nn.Parameter(parameter.detach().float().clone()) for parameter in parameters
     ]
+    decay_parameters = {id(tmix.w0), id(tmix.w2)}
     optimizer = torch.optim.AdamW(
-        master_parameters, lr=lr, betas=(0.9, 0.99), weight_decay=weight_decay
+        [
+            {
+                "params": [
+                    master
+                    for parameter, master in zip(parameters, master_parameters)
+                    if id(parameter) not in decay_parameters
+                ],
+                "lr": lr,
+            },
+            {
+                "params": [
+                    master
+                    for parameter, master in zip(parameters, master_parameters)
+                    if id(parameter) in decay_parameters
+                ],
+                "lr": lr * GQA_DECAY_LR_SCALE,
+            },
+        ],
+        betas=(0.9, 0.99),
+        weight_decay=weight_decay,
     )
-    scheduler = _schedule(optimizer, epochs * len(loader), min_scale=0.0)
+    scheduler = _schedule(optimizer, epochs * steps_per_epoch, min_scale=0.0)
     best_validation = _evaluate_layer(
-        source_text, student, layer_idx, validation_hidden, world, device
+        source_text, student, layer_idx, validation_hidden, world, device, validation_v_first
     )
     best_state = {name: value.detach().cpu().clone() for name, value in tmix.state_dict().items()}
+    best_recall_pass = min(evaluate_gqa_recall(tmix, use_flash=True).values()) >= 0.9
     best_epoch = -1
     stale = 0
     for epoch in range(epochs):
         train_mixed = torch.zeros((), device=device)
         train_pure = torch.zeros((), device=device)
-        for (hidden_cpu,) in loader:
+        for hidden_cpu, first in _hidden_batches(train_hidden, train_v_first):
             hidden = hidden_cpu.to(device)
             with torch.no_grad():
                 teacher_tmix = _teacher_tmix_output(source_text, layer_idx, hidden)
-            pure_tmix, _ = wrapper(layer.input_layernorm(hidden))
+            pure_tmix, _ = wrapper(
+                layer.input_layernorm(hidden), None if first is None else first.to(device)
+            )
             mixed_tmix = _mix_teacher(pure_tmix.float(), teacher_tmix.float(), gate)
             mixed_loss = _nmse_loss(mixed_tmix, teacher_tmix)
             pure_loss = _nmse_loss(pure_tmix, teacher_tmix)
@@ -653,16 +740,25 @@ def _run_gqa_phase(
             with torch.no_grad():
                 _project_gqa_feature_geometry(parameters, master_parameters)
                 for parameter, master in zip(parameters, master_parameters, strict=True):
+                    if parameter is tmix.w0:
+                        master.clamp_(0, 1 - 1e-4)
+                    elif parameter is tmix.a0:
+                        master.clamp_(0, 1)
                     parameter.copy_(master.to(parameter.dtype))
             scheduler.step()
-            train_mixed += mixed_loss.detach() / len(loader)
-            train_pure += pure_loss.detach() / len(loader)
+            train_mixed += mixed_loss.detach() / steps_per_epoch
+            train_pure += pure_loss.detach() / steps_per_epoch
         validation = _evaluate_layer(
-            source_text, student, layer_idx, validation_hidden, world, device
+            source_text, student, layer_idx, validation_hidden, world, device, validation_v_first
         )
         _require_finite_metrics(validation, layer_idx, f"{phase} gate {gate} epoch {epoch}")
-        if _validation_is_better(validation, best_validation):
+        recall = evaluate_gqa_recall(tmix, use_flash=True)
+        recall_pass = min(recall.values()) >= 0.9
+        if recall_pass and (
+            not best_recall_pass or _validation_is_better(validation, best_validation)
+        ):
             best_validation = dict(validation)
+            best_recall_pass = True
             best_state = {
                 name: value.detach().cpu().clone() for name, value in tmix.state_dict().items()
             }
@@ -684,6 +780,7 @@ def _run_gqa_phase(
                     "validation_pure_tmix_nmse": validation["tmix_output_nmse"],
                     "validation_pure_block_nmse": validation["layer_output_nmse"],
                     "best_pure_block_nmse": best_validation["layer_output_nmse"],
+                    "recall_min_hit_at_1": min(recall.values()),
                     "epochs_without_pure_improvement": stale,
                 },
                 flush=True,
@@ -705,38 +802,73 @@ def _align_gqa_layer(
     *,
     cache=None,
     hidden_cache=None,
+    v_first=None,
+    skip_transfer=False,
+    epochs=8,
+    learning_rate=3e-5,
+    train_dynamics=True,
+    output=None,
 ):
     tmix = student.model.layers[layer_idx].tmix
+    train_v_first = None if v_first is None else v_first[24:]
+    validation_v_first = None if v_first is None else v_first[8:24]
     initial_state = {
         name: value.detach().cpu().clone() for name, value in tmix.state_dict().items()
     }
     before_distillation = _evaluate_layer(
-        source_text, student, layer_idx, validation_hidden, world, device
+        source_text, student, layer_idx, validation_hidden, world, device, validation_v_first
     )
+    if world == 1 or dist.get_rank() == 0:
+        print(
+            {
+                "layer": layer_idx,
+                "stage": "gqa_initial_validation",
+                "validation": before_distillation,
+                "train_dynamics": train_dynamics,
+                "decay_learning_rate_scale": GQA_DECAY_LR_SCALE,
+            },
+            flush=True,
+        )
     try:
         stage_history = []
-        attention_validation, attention_epoch = _run_gqa_phase(
-            source_text,
-            student,
-            layer_idx,
-            train_hidden,
-            validation_hidden,
-            world,
-            device,
-            gate=GQA_GATE_SCHEDULE[0],
-            phase="attention_transfer",
-            epochs=16,
-            patience=4,
-            lr=1e-2,
-            weight_decay=0.0,
-        )
-        stage_history.append(
-            {"gate": GQA_GATE_SCHEDULE[0], "phase": "attention_transfer", **attention_validation}
-        )
-        if cache is not None:
-            _refresh_gqa_stage_cache(
-                source_text, student, layer_idx, hidden_cache, cache, device, GQA_GATE_SCHEDULE[0]
+        attention_validation, attention_epoch = before_distillation, -1
+        if not skip_transfer:
+            attention_validation, attention_epoch = _run_gqa_phase(
+                source_text,
+                student,
+                layer_idx,
+                train_hidden,
+                validation_hidden,
+                world,
+                device,
+                gate=GQA_GATE_SCHEDULE[0],
+                phase="attention_transfer",
+                epochs=16,
+                patience=4,
+                lr=1e-2,
+                weight_decay=0.0,
+                train_v_first=train_v_first,
+                validation_v_first=validation_v_first,
+                train_dynamics=train_dynamics,
             )
+            stage_history.append(
+                {
+                    "gate": GQA_GATE_SCHEDULE[0],
+                    "phase": "attention_transfer",
+                    **attention_validation,
+                }
+            )
+            if cache is not None:
+                _refresh_gqa_stage_cache(
+                    source_text,
+                    student,
+                    layer_idx,
+                    hidden_cache,
+                    cache,
+                    device,
+                    GQA_GATE_SCHEDULE[0],
+                    v_first,
+                )
         for gate in GQA_GATE_SCHEDULE:
             validation, _ = _run_gqa_phase(
                 source_text,
@@ -748,19 +880,35 @@ def _align_gqa_layer(
                 device,
                 gate=gate,
                 phase="distillation",
-                epochs=8,
+                epochs=epochs,
                 patience=4,
-                lr=3e-5,
+                lr=learning_rate,
                 weight_decay=0.1,
+                train_v_first=train_v_first,
+                validation_v_first=validation_v_first,
+                train_dynamics=train_dynamics,
             )
             stage_history.append({"gate": gate, "phase": "distillation", **validation})
             if cache is not None:
                 _refresh_gqa_stage_cache(
-                    source_text, student, layer_idx, hidden_cache, cache, device, gate
+                    source_text, student, layer_idx, hidden_cache, cache, device, gate, v_first
                 )
-        native = _evaluate_layer(source_text, student, layer_idx, validation_hidden, world, device)
+        if output is not None and (world == 1 or dist.get_rank() == 0):
+            # A gate-zero research candidate is distinct from an accepted layer.
+            # Preserve it so runtime fixes can be evaluated without retraining.
+            _assert_pure_rwkv_state(tmix)
+            save_file(
+                {
+                    name: value.detach().cpu().contiguous()
+                    for name, value in tmix.state_dict().items()
+                },
+                str(output / "gqa_candidate.safetensors"),
+            )
+        native = _evaluate_layer(
+            source_text, student, layer_idx, validation_hidden, world, device, validation_v_first
+        )
         reference = _evaluate_gqa_reference(
-            source_text, student, layer_idx, validation_hidden, world, device
+            source_text, student, layer_idx, validation_hidden, world, device, validation_v_first
         )
         recall = evaluate_gqa_recall(tmix, use_flash=True)
         if world == 1 or dist.get_rank() == 0:
@@ -782,6 +930,7 @@ def _align_gqa_layer(
             dist.get_rank() if world > 1 else 0,
             world,
             device,
+            validation_v_first,
         )
         return {
             "attention_transfer_best_epoch": attention_epoch,
@@ -809,6 +958,10 @@ def _layerwise(
     through_layer,
     *,
     prefix_cache: Path | None = None,
+    gqa_initial_checkpoint=None,
+    gqa_epochs=8,
+    gqa_learning_rate=3e-5,
+    gqa_train_dynamics=True,
 ):
     cache = LastLayerCache(output / "cache", rank)
     if prefix_cache is None:
@@ -828,13 +981,17 @@ def _layerwise(
             raise ValueError("GQA prefix-cache mode is restricted to layer 3")
         if _completed_layers(output):
             raise ValueError("GQA prefix-cache mode requires a fresh output directory")
-        reused_hidden = LastLayerCache(prefix_cache, rank).load()
+        reused_cache = LastLayerCache(prefix_cache, rank)
+        reused_hidden = reused_cache.load()
+        reused_first = reused_cache.load_v_first()
+        if reused_first is None:
+            raise ValueError("prefix cache must be rebuilt with first-layer values for RWKV")
         if reused_hidden.shape != (ids.shape[0], ids.shape[1], student.config.hidden_size):
             raise ValueError(
                 "GQA prefix cache shape does not match the immutable packed rows: "
                 f"cache={tuple(reused_hidden.shape)} ids={tuple(ids.shape)}"
             )
-        cache.store(reused_hidden, "next")
+        cache.store(reused_hidden, "next", v_first=reused_first)
         cache.advance()
         prefix_strict_pass = False
         if rank == 0:
@@ -850,6 +1007,7 @@ def _layerwise(
     strict_failures: list[str] = []
     for index in range(completed, through_layer + 1):
         hidden_cache = cache.load()
+        first_cache = cache.load_v_first()
         if hidden_cache.shape[0] < 32:
             raise ValueError("each rank needs at least 32 packed rows for isolated data splits")
         init_local = hidden_cache[:8].to(device)
@@ -863,6 +1021,20 @@ def _layerwise(
             if rank == 0
             else {}
         )
+        if rank == 0 and index == 3 and gqa_initial_checkpoint is not None:
+            _load_gqa_initial_checkpoint(
+                student.model.layers[index].tmix, Path(gqa_initial_checkpoint)
+            )
+            print(
+                {
+                    "stage": "gqa_initial_checkpoint",
+                    "path": str(gqa_initial_checkpoint),
+                    "train_dynamics": gqa_train_dynamics,
+                    "epochs_per_gate": gqa_epochs,
+                    "learning_rate": gqa_learning_rate,
+                },
+                flush=True,
+            )
         if rank == 0:
             _require_finite_tmix(
                 student.model.layers[index].tmix, index, "before-distillation initialization"
@@ -886,9 +1058,21 @@ def _layerwise(
                 device,
                 cache=cache,
                 hidden_cache=hidden_cache,
+                v_first=first_cache,
+                skip_transfer=index == 3 and gqa_initial_checkpoint is not None,
+                epochs=gqa_epochs,
+                learning_rate=gqa_learning_rate,
+                train_dynamics=gqa_train_dynamics,
+                output=output,
             )
             train_metrics = _evaluate_layer(
-                source_text, student, index, train_hidden, world, device
+                source_text,
+                student,
+                index,
+                train_hidden,
+                world,
+                device,
+                None if first_cache is None else first_cache[24:],
             )
             validation_metrics = result["native_validation"]
             layer_strict_pass = (
@@ -928,13 +1112,7 @@ def _layerwise(
                     _save_layer(output, index, tmix)
             if world > 1:
                 dist.barrier()
-            objective = _LayerObjective(layer)
-            chunks = []
-            with torch.no_grad():
-                for hidden in hidden_cache.split(8):
-                    chunks.append(objective(hidden.to(device))[0].cpu())
-            cache.store(torch.cat(chunks), "next")
-            cache.advance()
+            _cache_layer(layer, hidden_cache, first_cache, cache, device)
             continue
         wrapper = _LayerObjective(layer)
         if world > 1:
@@ -1104,13 +1282,7 @@ def _layerwise(
         if world > 1:
             dist.barrier()
         layer.train()
-        chunks = []
-        objective = wrapper.module if world > 1 else wrapper
-        with torch.no_grad():
-            for hidden in hidden_cache.split(8):
-                chunks.append(objective(hidden.to(device))[0].cpu())
-        cache.store(torch.cat(chunks), "next")
-        cache.advance()
+        _cache_layer(layer, hidden_cache, first_cache, cache, device)
     if strict_failures:
         raise RuntimeError(
             "layer validation regressed relative to initialization after "
@@ -1134,9 +1306,35 @@ def _global_kl(
 ):
     ordinary = _set_global_parameters(student)
     master_parameters = [nn.Parameter(parameter.detach().float().clone()) for parameter in ordinary]
+    decay_ids = {
+        id(parameter)
+        for name, parameter in student.named_parameters()
+        if name.endswith((".tmix.w0", ".tmix.w2"))
+    }
+    bounded = {
+        id(parameter): (1 - 1e-4 if name.endswith(".w0") else 1)
+        for name, parameter in student.named_parameters()
+        if name.endswith((".tmix.w0", ".tmix.a0"))
+    }
     optimizer = torch.optim.AdamW(
-        master_parameters,
-        lr=1e-6,
+        [
+            {
+                "params": [
+                    master
+                    for parameter, master in zip(ordinary, master_parameters)
+                    if id(parameter) not in decay_ids
+                ],
+                "lr": 1e-6,
+            },
+            {
+                "params": [
+                    master
+                    for parameter, master in zip(ordinary, master_parameters)
+                    if id(parameter) in decay_ids
+                ],
+                "lr": 1e-6 * GQA_DECAY_LR_SCALE,
+            },
+        ],
         weight_decay=0.1,
         betas=(0.9, 0.99),
     )
@@ -1185,6 +1383,8 @@ def _global_kl(
             optimizer.step()
             with torch.no_grad():
                 for parameter, master in zip(ordinary, master_parameters, strict=True):
+                    if id(parameter) in bounded:
+                        master.clamp_(0, bounded[id(parameter)])
                     parameter.copy_(master.to(parameter.dtype))
             scheduler.step()
             total += loss_value / len(loader)
@@ -1199,6 +1399,15 @@ def _global_kl(
             break
     if rank == 0:
         _assert_pure_rwkv_state(student)
+        for index, layer in enumerate(student.model.layers):
+            if student.config.source_layer_types[index] == "full_attention":
+                recall = evaluate_gqa_recall(layer.tmix, use_flash=True)
+                if min(recall.values()) < 0.9:
+                    raise RuntimeError(f"global KL regressed layer {index} recall: {recall}")
+        student.generation_config.eos_token_id = list(
+            dict.fromkeys((student.config.eos_token_id, tokenizer.eos_token_id))
+        )
+        student.generation_config.pad_token_id = tokenizer.pad_token_id
         student.eval().half()
         student.save_pretrained(output, safe_serialization=True)
         tokenizer.save_pretrained(output)
@@ -1222,19 +1431,30 @@ def _accept(output: Path) -> bool:
         token_ids = encoded["input_ids"].cuda()
         with torch.no_grad():
             generated = model.generate(
-                token_ids, use_cache=True, do_sample=False, max_new_tokens=128
+                token_ids, use_cache=True, do_sample=False, max_new_tokens=512
             )
         answer_ids = generated[0, token_ids.shape[1] :]
         answer = tokenizer.decode(answer_ids, skip_special_tokens=True)
         tokens = answer_ids.tolist()
+        eos = model.generation_config.eos_token_id
+        eos = [eos] if isinstance(eos, int) else eos
+        finished = bool(tokens) and tokens[-1] in eos
         coherent = bool(answer.strip()) and "�" not in answer
         if tokens:
             coherent = (
                 coherent and max(tokens.count(token) for token in set(tokens)) < len(tokens) * 0.8
             )
-        passed = passed and coherent
-        records.append({"prompt": prompt, "token_ids": token_ids[0].tolist(), "output": answer})
-    result = {"passed": passed, "generations": records}
+        passed = passed and coherent and finished
+        records.append(
+            {
+                "prompt": prompt,
+                "token_ids": token_ids[0].tolist(),
+                "output": answer,
+                "generated_tokens": len(tokens),
+                "finish_reason": "eos" if finished else "length",
+            }
+        )
+    result = {"scope": "generation_smoke", "passed": passed, "generations": records}
     (output / "acceptance.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -1260,8 +1480,14 @@ def convert_qwen3_5_2b(
     agentic: str,
     math_dataset: str,
     through_layer: int = 23,
+    *,
+    gqa_initial_checkpoint=None,
+    gqa_epochs=8,
+    gqa_learning_rate=3e-5,
+    gqa_train_dynamics=True,
 ):
     rank, world, device = _distributed()
+    torch.manual_seed(42)
     output_path = Path(output).resolve()
     if output_path == Path(source).resolve():
         raise ValueError("output must not overwrite the source checkpoint")
@@ -1296,6 +1522,10 @@ def convert_qwen3_5_2b(
         world,
         device,
         through_layer,
+        gqa_initial_checkpoint=gqa_initial_checkpoint,
+        gqa_epochs=gqa_epochs,
+        gqa_learning_rate=gqa_learning_rate,
+        gqa_train_dynamics=gqa_train_dynamics,
     )
     if through_layer < student.config.num_hidden_layers - 1:
         if world > 1:
@@ -1333,14 +1563,24 @@ def convert_qwen3_5_2b(
         if world > 1:
             dist.broadcast(failed, 0)
         if failed.item():
-            raise RuntimeError("migration loop failed the only allowed generation acceptance")
+            raise RuntimeError("generation smoke test failed after global KL refinement")
     if world > 1:
         dist.destroy_process_group()
 
 
-def convert_gqa_from_prefix_cache(source: str, output: str, prefix_cache: str) -> None:
+def convert_gqa_from_prefix_cache(
+    source: str,
+    output: str,
+    prefix_cache: str,
+    *,
+    gqa_initial_checkpoint=None,
+    gqa_epochs=8,
+    gqa_learning_rate=3e-5,
+    gqa_train_dynamics=True,
+) -> None:
     """Run only layer-3 GQA work from a verified post-layer-2 rank-local cache."""
     rank, world, device = _distributed()
+    torch.manual_seed(42)
     output_path = Path(output).resolve()
     prefix_path = Path(prefix_cache).resolve()
     if output_path == Path(source).resolve() or output_path == prefix_path:
@@ -1369,6 +1609,10 @@ def convert_gqa_from_prefix_cache(source: str, output: str, prefix_cache: str) -
         device,
         3,
         prefix_cache=prefix_path,
+        gqa_initial_checkpoint=gqa_initial_checkpoint,
+        gqa_epochs=gqa_epochs,
+        gqa_learning_rate=gqa_learning_rate,
+        gqa_train_dynamics=gqa_train_dynamics,
     )
     if world > 1:
         dist.barrier()
@@ -1376,7 +1620,7 @@ def convert_gqa_from_prefix_cache(source: str, output: str, prefix_cache: str) -
 
 
 def continue_global_kl(source: str, output: str) -> None:
-    """Run the single permitted corrective KL epoch from the saved final model."""
+    """Run another global KL epoch from the saved final model."""
     from ..transformers.modeling_qwen2rwkv import Qwen2RWKVForCausalLM
 
     rank, world, device = _distributed()
@@ -1415,7 +1659,22 @@ def main():
     parser.add_argument("--global-kl-only", action="store_true")
     parser.add_argument("--through-layer", type=int, default=23)
     parser.add_argument("--gqa-prefix-cache")
+    parser.add_argument("--gqa-initial-checkpoint")
+    parser.add_argument(
+        "--gqa-epochs",
+        type=int,
+        default=8,
+        help="epochs per gate; zero replays acceptance without optimization",
+    )
+    parser.add_argument("--gqa-learning-rate", type=float, default=3e-5)
+    parser.add_argument(
+        "--gqa-freeze-dynamics",
+        action="store_true",
+        help="matched-budget ablation: train only transferred parameters",
+    )
     args = parser.parse_args()
+    if args.gqa_epochs < 0 or args.gqa_learning_rate <= 0:
+        parser.error("GQA epochs must be nonnegative and learning rate must be positive")
     if args.accept_only:
         raise SystemExit(0 if _accept(Path(args.output)) else 1)
     if args.source is None:
@@ -1435,7 +1694,15 @@ def main():
         continue_global_kl(args.source, args.output)
         return
     if args.gqa_prefix_cache is not None:
-        convert_gqa_from_prefix_cache(args.source, args.output, args.gqa_prefix_cache)
+        convert_gqa_from_prefix_cache(
+            args.source,
+            args.output,
+            args.gqa_prefix_cache,
+            gqa_initial_checkpoint=args.gqa_initial_checkpoint,
+            gqa_epochs=args.gqa_epochs,
+            gqa_learning_rate=args.gqa_learning_rate,
+            gqa_train_dynamics=not args.gqa_freeze_dynamics,
+        )
         return
     convert_qwen3_5_2b(
         args.source,
@@ -1443,6 +1710,10 @@ def main():
         args.agentic,
         args.math_dataset,
         args.through_layer,
+        gqa_initial_checkpoint=args.gqa_initial_checkpoint,
+        gqa_epochs=args.gqa_epochs,
+        gqa_learning_rate=args.gqa_learning_rate,
+        gqa_train_dynamics=not args.gqa_freeze_dynamics,
     )
 
 

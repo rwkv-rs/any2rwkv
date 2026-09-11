@@ -33,7 +33,7 @@ GQA_FEATURE_PROJECTION_DIM = 64
 GQA_FEATURE_OUTPUT_DIM = 128
 GQA_STATES_PER_QUERY_HEAD = 2
 GQA_READOUT_MODE = "rwkv_feature_state"
-GQA_CHECKPOINT_SCHEMA = "gqa_rwkv_feature_state_d256x2_v2"
+GQA_CHECKPOINT_SCHEMA = "gqa_rwkv_tmix_d256x2_v3"
 GQA_DECAY_LOGITS = -30.0
 # FlashRWKV2 keeps recurrent state in the operator dtype.  A shared scale is
 # applied to numerator and denominator writes so the ratio is unchanged while
@@ -53,10 +53,7 @@ class _FP32RotaryEmbedding(Qwen3_5TextRotaryEmbedding):
             self.config.hidden_size // self.config.num_attention_heads
         )
         dim = int(head_dim * partial_rotary_factor)
-        return (
-            1.0
-            / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
-        )
+        return 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
 
     def _apply(self, fn, recurse: bool = True):
         probe = torch.empty(0, device=self.inv_freq.device, dtype=torch.float32)
@@ -181,8 +178,9 @@ class Qwen2RWKVConfig(Qwen3_5TextConfig):
                 )
             if config_dict.get("gqa_checkpoint_schema") != GQA_CHECKPOINT_SCHEMA:
                 raise ValueError(
-                    "bounded-Hedgehog GQA artifact is incompatible with the pure RWKV "
-                    f"feature-state checkpoint schema {GQA_CHECKPOINT_SCHEMA!r}"
+                    "incompatible GQA checkpoint schema "
+                    f"{config_dict.get('gqa_checkpoint_schema')!r}; "
+                    f"expected {GQA_CHECKPOINT_SCHEMA!r}"
                 )
             missing = {
                 "gqa_feature_projection_dim",
@@ -344,7 +342,11 @@ class Qwen2RWKVCache(Cache):
 
 
 def _recurrent_cache_states(
-    cache: Qwen2RWKVCache, layer_idx: int, x: torch.Tensor, heads: int, dim: int
+    cache: Qwen2RWKVCache,
+    layer_idx: int,
+    x: torch.Tensor,
+    heads: int,
+    dim: int,
 ):
     batch = x.shape[0]
     layer = cache.layers[layer_idx]
@@ -456,7 +458,7 @@ class Qwen2RWKVGatedDeltaNet(Qwen3_5GatedDeltaNet):
         query, key, value, beta, log_decay, z = self._source_activations(x, None, attention_mask)
         r, w, k, v, a, b = self._wkv_inputs(query, key, value, beta, log_decay, training=True)
         raw = flash.pretrain_recurrent_bf16(r, w, k, v, a, b, head_size=self.head_v_dim)
-        return self._source_boundary(raw.view_as(value), z)
+        return self._source_boundary(raw.view_as(value), z), value.flatten(2)
 
     def _inference_forward(
         self,
@@ -488,14 +490,16 @@ class Qwen2RWKVGatedDeltaNet(Qwen3_5GatedDeltaNet):
             max_seqlen=length,
             validated_metadata=ticket,
         ).view_as(value)
-        return self._source_boundary(raw, z)
+        return self._source_boundary(raw, z), value.flatten(2)
 
     def forward(self, x, v_first=None, past_key_values=None, attention_mask=None):
         if self.training:
-            return self._training_forward(x, attention_mask), v_first
-        if not isinstance(past_key_values, Qwen2RWKVCache):
-            raise TypeError("inference requires Qwen2RWKVCache")
-        return self._inference_forward(x, past_key_values, attention_mask), v_first
+            output, value = self._training_forward(x, attention_mask)
+        else:
+            if not isinstance(past_key_values, Qwen2RWKVCache):
+                raise TypeError("inference requires Qwen2RWKVCache")
+            output, value = self._inference_forward(x, past_key_values, attention_mask)
+        return output, value if v_first is None else v_first
 
 
 def _repeat_gqa(tensor: torch.Tensor, groups: int) -> torch.Tensor:
@@ -503,7 +507,12 @@ def _repeat_gqa(tensor: torch.Tensor, groups: int) -> torch.Tensor:
 
 
 class Qwen2RWKVTimeMix(nn.Module):
-    """Pure positive-feature RWKV state used for converted GQA layers."""
+    """Source GQA shell with function-preserving, learnable RWKV-7 dynamics.
+
+    The numerator uses diagonal-plus-rank-one updates. The positive denominator
+    shares the diagonal decay, but does not undergo signed state corrections.
+    Source projections, RoPE and output gate remain the transfer boundary.
+    """
 
     def __init__(self, config: Qwen2RWKVConfig, layer_idx: int):
         super().__init__()
@@ -518,8 +527,9 @@ class Qwen2RWKVTimeMix(nn.Module):
         self.states_per_head = config.gqa_states_per_query_head
         self.kernel_heads = self.num_heads * self.states_per_head
         self.recurrent_width = self.kernel_heads * self.head_size
-
         channels = config.hidden_size
+        feature_channels = self.num_heads * self.feature_output_dim
+        rank = 32
         self.q_proj = nn.Linear(
             channels, self.num_heads * self.head_size * 2, bias=config.attention_bias
         )
@@ -536,17 +546,39 @@ class Qwen2RWKVTimeMix(nn.Module):
         self.k_norm = Qwen3_5RMSNorm(self.head_size, eps=config.rms_norm_eps)
         self.rotary_emb = _FP32RotaryEmbedding(config)
         self.feature_q_weight = nn.Parameter(
-            torch.zeros(self.num_heads, self.head_size, self.feature_projection_dim)
+            torch.empty(self.num_heads, self.head_size, self.feature_projection_dim)
         )
-        self.feature_k_weight = nn.Parameter(torch.zeros_like(self.feature_q_weight))
+        self.feature_k_weight = nn.Parameter(torch.empty_like(self.feature_q_weight))
+        for name in ("r", "w", "k", "v", "a", "g"):
+            setattr(self, f"x_{name}", nn.Parameter(torch.zeros(channels)))
+        for name, width in (("w", feature_channels), ("a", feature_channels), ("v", channels)):
+            setattr(self, f"{name}0", nn.Parameter(torch.zeros(width)))
+            setattr(self, f"{name}1", nn.Parameter(torch.empty(channels, rank)))
+            setattr(self, f"{name}2", nn.Parameter(torch.zeros(rank, width)))
+        self.k_k = nn.Parameter(torch.ones(self.num_heads, self.feature_output_dim))
+        self.k_a = nn.Parameter(torch.zeros_like(self.k_k))
+        self.r_k = nn.Parameter(torch.zeros_like(self.k_k))
+        self.norm_mix = nn.Parameter(torch.zeros(self.num_heads))
+        self.ln_x = nn.GroupNorm(self.num_heads, channels, eps=64e-5)
         self.reset_parameters()
 
+    @torch.no_grad()
     def reset_parameters(self) -> None:
-        with torch.no_grad():
-            for weight in (self.feature_q_weight, self.feature_k_weight):
-                weight.zero_()
-                for head in weight:
-                    nn.init.eye_(head)
+        for weight in (self.feature_q_weight, self.feature_k_weight):
+            for head in weight:
+                nn.init.eye_(head)
+        for name in ("r", "w", "k", "v", "a", "g"):
+            getattr(self, f"x_{name}").zero_()
+        for name in ("w", "a", "v"):
+            getattr(self, f"{name}0").zero_()
+            nn.init.normal_(getattr(self, f"{name}1"), std=self.config.hidden_size**-0.5)
+            getattr(self, f"{name}2").zero_()
+        self.k_k.fill_(1)
+        self.k_a.zero_()
+        self.r_k.zero_()
+        self.norm_mix.zero_()
+        self.ln_x.weight.fill_(1)
+        self.ln_x.bias.zero_()
 
     def load_source_attention(self, source: nn.Module) -> None:
         for name in ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm"):
@@ -556,165 +588,226 @@ class Qwen2RWKVTimeMix(nn.Module):
     def attention_transfer_parameters(self) -> list[nn.Parameter]:
         return [self.feature_q_weight, self.feature_k_weight]
 
-    def _project_qkv(
-        self,
-        x: torch.Tensor,
-        position_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch, length = x.shape[:2]
-        projected = self.q_proj(x).view(batch, length, self.num_heads, 2 * self.head_size)
+    @staticmethod
+    def _shift_delta(x: torch.Tensor, cache_layer=None) -> torch.Tensor:
+        previous = torch.zeros_like(x[:, :1])
+        if cache_layer is not None and cache_layer.is_conv_states_initialized[0]:
+            previous = cache_layer.conv_states[0].transpose(1, 2)
+        delta = torch.cat((previous, x[:, :-1]), dim=1) - x
+        if cache_layer is not None:
+            last = x[:, -1:].transpose(1, 2).contiguous()
+            if not cache_layer.is_conv_states_initialized[0]:
+                cache_layer.lazy_initialization(conv_states=last, state_idx=0)
+            cache_layer.conv_states[0].copy_(last)
+        return delta
+
+    def _project_qkv(self, x, position_ids, delta=None):
+        if delta is None:
+            delta = self._shift_delta(x)
+        batch, length, _ = x.shape
+        projected = self.q_proj(x + self.x_r * delta).view(
+            batch, length, self.num_heads, 2 * self.head_size
+        )
         query, gate = projected.chunk(2, dim=-1)
-        key = self.k_proj(x).view(batch, length, self.num_kv_heads, self.head_size)
-        value = self.v_proj(x).view(batch, length, self.num_kv_heads, self.head_size)
+        # The joint source projection remains intact at initialization. The gate
+        # gets its own token shift through an initially zero input correction.
+        gate_weight = self.q_proj.weight.view(self.num_heads, 2, self.head_size, -1)[:, 1].reshape(
+            -1, x.shape[-1]
+        )
+        gate = gate.reshape(batch, length, -1) + F.linear(
+            (self.x_g - self.x_r) * delta, gate_weight
+        )
+        key = self.k_proj(x + self.x_k * delta).view(
+            batch, length, self.num_kv_heads, self.head_size
+        )
+        value = self.v_proj(x + self.x_v * delta).view(
+            batch, length, self.num_kv_heads, self.head_size
+        )
         query = self.q_norm(query).transpose(1, 2)
         key = self.k_norm(key).transpose(1, 2)
-        value = value.transpose(1, 2)
         cos, sin = self.rotary_emb(x, position_ids)
         query, key = apply_rotary_pos_emb(query, key, cos, sin)
-        return query, key, value, gate.reshape(batch, length, -1)
+        return query, key, value.transpose(1, 2), gate
 
     def _feature(self, value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         projected = torch.einsum("bhtd,hdf->bhtf", value.float(), weight.float())
         scale = projected.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)
-        positive = projected.relu()
-        negative = (-projected).relu()
-        positive = positive / scale
-        negative = negative / scale
-        feature = torch.cat((positive, negative), dim=-1) + 1e-4
+        feature = torch.cat((projected.relu(), (-projected).relu()), dim=-1) / scale + 1e-4
         return feature.to(value.dtype)
 
-    def _features(
-        self, query: torch.Tensor, key: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        key_heads = _repeat_gqa(key, self.num_kv_groups)
+    def _features(self, query, key):
         return (
             self._feature(query, self.feature_q_weight),
-            self._feature(key_heads, self.feature_k_weight),
+            self._feature(_repeat_gqa(key, self.num_kv_groups), self.feature_k_weight),
         )
 
-    def _state_reference(
-        self,
-        feature_query: torch.Tensor,
-        feature_key: torch.Tensor,
-        value_heads: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch, heads, length, _ = feature_query.shape
-        numerator_state = torch.zeros(
-            batch,
-            heads,
-            self.head_size,
-            self.feature_output_dim,
-            dtype=torch.float32,
-            device=feature_query.device,
+    def _dynamics(self, x, delta):
+        # Train the bounded retention fraction, not saturated decay logits. The
+        # small positive floor maps zero exactly to the previous -30 logits and
+        # keeps the inverse-logit chain rule finite in FP32 at that boundary.
+        fraction = (
+            self.w0.float()
+            + torch.tanh((x + self.x_w * delta).float() @ self.w1.float()) @ self.w2.float()
         )
-        denominator_state = torch.zeros(
-            batch,
-            heads,
-            self.feature_output_dim,
-            dtype=torch.float32,
-            device=feature_query.device,
+        fraction = fraction.clamp(0, 1 - CLAMP_W_EPSILON) + math.exp(GQA_DECAY_LOGITS)
+        decay = torch.logit(fraction).to(x.dtype)
+        erase = (
+            self.a0.float()
+            + torch.tanh((x + self.x_a * delta).float() @ self.a1.float()) @ self.a2.float()
+        ).clamp(0, 1)
+        shape = (*x.shape[:2], self.num_heads, self.feature_output_dim)
+        return decay.view(shape).transpose(1, 2), erase.to(x.dtype).view(shape).transpose(1, 2)
+
+    def _inputs(self, x, positions, v_first=None, delta=None):
+        if delta is None:
+            delta = self._shift_delta(x)
+        query, key, value, gate = self._project_qkv(x, positions, delta)
+        feature_query, feature_key = self._features(query, key)
+        value = _repeat_gqa(value, self.num_kv_groups)
+        value, first = self._mix_values(x, delta, value, v_first)
+        return feature_query, feature_key, value, gate, self._dynamics(x, delta), first
+
+    def _mix_values(self, x, delta, value, v_first=None):
+        first = value.transpose(1, 2).reshape_as(x) if v_first is None else v_first
+        blend = torch.tanh(
+            self.v0.float()
+            + torch.sigmoid((x + self.x_v * delta).float() @ self.v1.float()) @ self.v2.float()
         )
-        numerator = torch.empty(
-            batch, heads, length, self.head_size, dtype=torch.float32, device=feature_query.device
+        first_heads = first.view(*x.shape[:2], self.num_heads, self.head_size).transpose(1, 2)
+        value = value + blend.view(*x.shape[:2], self.num_heads, self.head_size).transpose(1, 2).to(
+            value.dtype
+        ) * (first_heads - value)
+        return value, first
+
+    def _state_components(self, feature_key, controls=None):
+        if controls is None:
+            decay = torch.full_like(feature_key, GQA_DECAY_LOGITS)
+            erase = torch.zeros_like(feature_key)
+        else:
+            decay, erase = controls
+        key = feature_key * (1 + (erase - 1) * self.k_a[None, :, None, :])
+        direction = F.normalize(
+            feature_key.float() * self.k_k[None, :, None, :].float(), dim=-1
+        ).to(feature_key.dtype)
+        return decay, key, -direction, direction * erase
+
+    def _state_reference(self, feature_query, feature_key, value_heads, controls=None):
+        batch, heads, length, features = feature_query.shape
+        decay, key, a, b = self._state_components(feature_key, controls)
+        state = torch.zeros(
+            batch, heads, self.head_size, features, dtype=torch.float32, device=feature_query.device
         )
-        denominator = torch.empty(
-            batch, heads, length, dtype=torch.float32, device=feature_query.device
+        normalizer = torch.zeros(
+            batch, heads, features, dtype=torch.float32, device=feature_query.device
         )
+        numerator, denominator = [], []
         for token in range(length):
-            key_token = feature_key[:, :, token].float()
-            value_token = value_heads[:, :, token].float()
-            numerator_state = numerator_state + value_token.unsqueeze(-1) * key_token.unsqueeze(-2)
-            denominator_state = denominator_state + key_token
+            retention = (W_SCALE * decay[:, :, token].float().sigmoid()).exp()
+            correction = torch.einsum("bhdf,bhf->bhd", state, a[:, :, token].float())
+            state = (
+                state * retention.unsqueeze(-2)
+                + correction.unsqueeze(-1) * b[:, :, token].float().unsqueeze(-2)
+                + value_heads[:, :, token].float().unsqueeze(-1)
+                * key[:, :, token].float().unsqueeze(-2)
+            )
+            normalizer = normalizer * retention + feature_key[:, :, token].float()
             read = feature_query[:, :, token].float()
-            numerator[:, :, token] = torch.einsum("bhdf,bhf->bhd", numerator_state, read)
-            denominator[:, :, token] = torch.einsum("bhf,bhf->bh", denominator_state, read)
-        return numerator, denominator
+            numerator.append(torch.einsum("bhdf,bhf->bhd", state, read))
+            denominator.append((normalizer * read).sum(-1))
+        return torch.stack(numerator, dim=2), torch.stack(denominator, dim=2)
 
-    def _state_training(
-        self,
-        feature_query: torch.Tensor,
-        feature_key: torch.Tensor,
-        value_heads: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _wkv_inputs(self, feature_query, feature_key, value_heads, controls=None):
+        decay, key, a, b = self._state_components(feature_key, controls)
+        pad = self.head_size - self.feature_output_dim
+
+        def paired(left, right):
+            return torch.stack((left, right), dim=3).permute(0, 2, 1, 3, 4).contiguous()
+
+        read = F.pad(feature_query, (0, pad))
+        decay = F.pad(decay, (0, pad), value=GQA_DECAY_LOGITS)
+        key = F.pad(key, (0, pad))
+        denominator_key = F.pad(feature_key, (0, pad))
+        a, b = F.pad(a, (0, pad)), F.pad(b, (0, pad))
+        zeros = torch.zeros_like(a)
+        return tuple(
+            tensor.flatten(2)
+            for tensor in (
+                paired(read, read),
+                paired(decay, decay),
+                paired(key, denominator_key),
+                paired(
+                    value_heads * GQA_STATE_SCALE, torch.ones_like(value_heads) * GQA_STATE_SCALE
+                ),
+                paired(a, zeros),
+                paired(b, zeros),
+            )
+        )
+
+    def _state_training(self, feature_query, feature_key, value_heads, controls=None):
         flash = _flash("training", feature_query)
         batch, _, length, _ = feature_query.shape
         if feature_query.dtype != torch.bfloat16 or length % 16:
-            raise RuntimeError(
-                "GQA training requires contiguous BF16 [B,T,2048] with T divisible by 16"
-            )
-        query_padded = F.pad(feature_query, (0, self.head_size - self.feature_output_dim))
-        key_padded = F.pad(feature_key, (0, self.head_size - self.feature_output_dim))
-        value_write = value_heads * GQA_STATE_SCALE
-        denominator_write = torch.ones_like(value_write) * GQA_STATE_SCALE
-        read = torch.stack((query_padded, query_padded), dim=3)
-        key = torch.stack((key_padded, key_padded), dim=3)
-        value = torch.stack((value_write, denominator_write), dim=3)
-        shape = (batch, length, self.recurrent_width)
-        read = read.permute(0, 2, 1, 3, 4).reshape(shape).contiguous()
-        key = key.permute(0, 2, 1, 3, 4).reshape(shape).contiguous()
-        value = value.permute(0, 2, 1, 3, 4).reshape(shape).contiguous()
-        decay = torch.full_like(read, GQA_DECAY_LOGITS)
-        erase = torch.zeros_like(read)
-        raw = flash.pretrain_recurrent_bf16(
-            read, decay, key, value, erase, erase, head_size=self.head_size
-        ).view(batch, length, self.num_heads, 2, self.head_size)
-        numerator = raw[..., 0, :].permute(0, 2, 1, 3).float() / GQA_STATE_SCALE
-        denominator = raw[..., 1, :].float().mean(-1).permute(0, 2, 1) / GQA_STATE_SCALE
-        return numerator, denominator
+            raise RuntimeError("GQA training requires BF16 inputs with T divisible by 16")
+        inputs = self._wkv_inputs(feature_query, feature_key, value_heads, controls)
+        raw = flash.pretrain_recurrent_bf16(*inputs, head_size=self.head_size).view(
+            batch, length, self.num_heads, 2, self.head_size
+        )
+        return (
+            raw[..., 0, :].permute(0, 2, 1, 3).float() / GQA_STATE_SCALE,
+            raw[..., 1, :].float().mean(-1).permute(0, 2, 1) / GQA_STATE_SCALE,
+        )
+
+    def _heads(
+        self,
+        numerator,
+        denominator,
+        feature_query=None,
+        feature_key=None,
+        value=None,
+        controls=None,
+    ):
+        heads = numerator / denominator.clamp_min(1e-12).unsqueeze(-1)
+        batch, _, length, _ = heads.shape
+        flat = heads.transpose(1, 2).reshape(batch * length, -1)
+        normalized = F.group_norm(
+            flat, self.num_heads, self.ln_x.weight.float(), self.ln_x.bias.float(), self.ln_x.eps
+        )
+        normalized = normalized.view(batch, length, self.num_heads, self.head_size).transpose(1, 2)
+        heads = heads + self.norm_mix.tanh()[None, :, None, None] * (normalized - heads)
+        if feature_query is not None:
+            _, key, _, _ = self._state_components(feature_key, controls)
+            shortcut = (
+                feature_query.float() * key.float() * self.r_k[None, :, None, :].float()
+            ).sum(-1, keepdim=True)
+            heads = heads + shortcut * value.float()
+        return heads
 
     def _readout(
-        self,
-        numerator: torch.Tensor,
-        denominator: torch.Tensor,
-        gate: torch.Tensor,
-    ) -> torch.Tensor:
-        heads = numerator / denominator.clamp_min(1e-12).unsqueeze(-1)
-        mixed = heads.transpose(1, 2).reshape(gate.shape[0], gate.shape[1], -1)
-        mixed = (mixed * torch.sigmoid(gate).float()).to(self.o_proj.weight.dtype)
-        return self.o_proj(mixed)
+        self, numerator, denominator, gate, query=None, key=None, value=None, controls=None
+    ):
+        heads = self._heads(numerator, denominator, query, key, value, controls)
+        mixed = heads.transpose(1, 2).reshape_as(gate)
+        return self.o_proj((mixed * gate.float().sigmoid()).to(self.o_proj.weight.dtype))
 
-    def attention_heads_reference(
-        self,
-        x: torch.Tensor,
-        position_ids: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def attention_heads_reference(self, x, position_ids=None, v_first=None):
         if position_ids is None:
-            position_ids = torch.arange(x.shape[1], device=x.device).view(1, -1)
-            position_ids = position_ids.expand(x.shape[0], -1)
-        query, key, value, gate = self._project_qkv(x, position_ids)
-        feature_query, feature_key = self._features(query, key)
-        value_heads = _repeat_gqa(value, self.num_kv_groups)
-        numerator, denominator = self._state_reference(feature_query, feature_key, value_heads)
-        heads = numerator / denominator.clamp_min(1e-12).unsqueeze(-1)
-        return heads, gate
+            position_ids = torch.arange(x.shape[1], device=x.device).expand(x.shape[0], -1)
+        query, key, value, gate, controls, _ = self._inputs(x, position_ids, v_first)
+        numerator, denominator = self._state_reference(query, key, value, controls)
+        return self._heads(numerator, denominator, query, key, value, controls), gate
 
-    def reference_forward(
-        self,
-        x: torch.Tensor,
-        position_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        heads, gate = self.attention_heads_reference(x, position_ids)
-        mixed = heads.transpose(1, 2).reshape(*x.shape)
-        mixed = (mixed * torch.sigmoid(gate).float()).to(self.o_proj.weight.dtype)
-        return self.o_proj(mixed)
+    def reference_forward(self, x, position_ids=None, v_first=None):
+        heads, gate = self.attention_heads_reference(x, position_ids, v_first)
+        mixed = heads.transpose(1, 2).reshape_as(gate) * gate.float().sigmoid()
+        return self.o_proj(mixed.to(self.o_proj.weight.dtype))
 
-    def _training_forward(
-        self, x: torch.Tensor, v_first: torch.Tensor | None
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        positions = torch.arange(x.shape[1], device=x.device).view(1, -1)
-        positions = positions.expand(x.shape[0], -1)
-        query, key, value, gate = self._project_qkv(x, positions)
-        feature_query, feature_key = self._features(query, key)
-        value_heads = _repeat_gqa(value, self.num_kv_groups)
-        numerator, denominator = self._state_training(feature_query, feature_key, value_heads)
-        return self._readout(numerator, denominator, gate), v_first
+    def _training_forward(self, x, v_first):
+        positions = torch.arange(x.shape[1], device=x.device).expand(x.shape[0], -1)
+        query, key, value, gate, controls, first = self._inputs(x, positions, v_first)
+        numerator, denominator = self._state_training(query, key, value, controls)
+        return self._readout(numerator, denominator, gate, query, key, value, controls), first
 
-    def _inference_forward(
-        self,
-        x: torch.Tensor,
-        v_first: torch.Tensor | None,
-        cache: Qwen2RWKVCache,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def _inference_forward(self, x, v_first, cache):
         flash = _flash("inference", x)
         if x.dtype != torch.float16:
             raise RuntimeError("GQA inference requires a float16 checkpoint")
@@ -724,32 +817,18 @@ class Qwen2RWKVTimeMix(nn.Module):
         )
         if not torch.equal(elapsed, elapsed[:1].expand_as(elapsed)):
             raise RuntimeError("RWKV cache requires equal sequence lengths in a batch")
-        start = int(elapsed[0].item())
-        positions = start + torch.arange(length, device=x.device)
-        position_ids = positions.view(1, -1).expand(batch, -1)
-        query, key, value, gate = self._project_qkv(x, position_ids)
-        feature_query, feature_key = self._features(query, key)
-        value_heads = _repeat_gqa(value, self.num_kv_groups)
-        query_padded = F.pad(feature_query, (0, self.head_size - self.feature_output_dim))
-        key_padded = F.pad(feature_key, (0, self.head_size - self.feature_output_dim))
-        value_heads = value_heads * GQA_STATE_SCALE
-        denominator_value = torch.ones_like(value_heads) * GQA_STATE_SCALE
-        read = torch.stack((query_padded, query_padded), dim=3).permute(0, 2, 1, 3, 4)
-        write_key = torch.stack((key_padded, key_padded), dim=3).permute(0, 2, 1, 3, 4)
-        write_value = torch.stack((value_heads, denominator_value), dim=3).permute(0, 2, 1, 3, 4)
-        read = read.reshape(batch * length, self.kernel_heads, self.head_size).contiguous()
-        write_key = write_key.reshape_as(read).contiguous()
-        write_value = write_value.reshape_as(read).contiguous()
-        decay = torch.full_like(read, GQA_DECAY_LOGITS)
-        erase = torch.zeros_like(read)
+        positions = (int(elapsed[0].item()) + torch.arange(length, device=x.device)).expand(
+            batch, -1
+        )
+        delta = self._shift_delta(x, cache.layers[self.layer_idx])
+        query, key, value, gate, controls, first = self._inputs(x, positions, v_first, delta)
+        inputs = tuple(
+            tensor.view(batch * length, self.kernel_heads, self.head_size)
+            for tensor in self._wkv_inputs(query, key, value, controls)
+        )
         offsets, indices, ticket = cache.recurrent_metadata(flash, batch, length, x.device)
         raw = flash.infer_recurrent_fp16_forward_varlen(
-            read,
-            decay,
-            write_key,
-            write_value,
-            erase,
-            erase,
+            *inputs,
             state_pool=state,
             elapsed_state_pool=elapsed,
             cu_seqlens=offsets,
@@ -757,10 +836,9 @@ class Qwen2RWKVTimeMix(nn.Module):
             max_seqlen=length,
             validated_metadata=ticket,
         ).view(batch, length, self.num_heads, 2, self.head_size)
-        numerator = raw[..., 0, :].permute(0, 2, 1, 3).float()
-        denominator = raw[..., 1, :].float().mean(-1).permute(0, 2, 1)
-        output = self._readout(numerator, denominator, gate)
-        return output, v_first
+        numerator = raw[..., 0, :].permute(0, 2, 1, 3).float() / GQA_STATE_SCALE
+        denominator = raw[..., 1, :].float().mean(-1).permute(0, 2, 1) / GQA_STATE_SCALE
+        return self._readout(numerator, denominator, gate, query, key, value, controls), first
 
     def forward(self, x, v_first=None, past_key_values=None, attention_mask=None):
         if attention_mask is not None and not torch.all(attention_mask == 1):

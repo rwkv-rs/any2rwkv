@@ -115,11 +115,13 @@ def initialize_gqa_layer(
 
 @torch.no_grad()
 def evaluate_gqa_recall(target, distances=(128, 256, 512, 1024), *, use_flash=False):
-    """Recall a value against repeated distractors through the actual feature maps.
+    """Feature-space retrieval with the learned RWKV dynamics enabled.
 
     The deterministic logits use a right-inverse of each current Q/K feature
     matrix. This keeps the fixture in feature space when shell weights are
-    fine-tuned and tests the recurrent kernel rather than a parameterization.
+    fine-tuned. Independent seeded hidden vectors drive decay, erase and value
+    residuals; the readout includes learned normalization and the RKV shortcut.
+    This is a controlled kernel probe, not a source-shell or language benchmark.
     """
     weight = target.feature_q_weight
     batch, heads, kv_heads, width = 2, target.num_heads, target.num_kv_heads, target.head_size
@@ -145,7 +147,7 @@ def evaluate_gqa_recall(target, distances=(128, 256, 512, 1024), *, use_flash=Fa
         key_logits.scatter_(-1, key_distractors[..., None], 10.0)
 
         def right_inverse(logits, matrix):
-            logits_batch, logits_heads, logits_length, logits_width = logits.shape
+            logits_batch, _, logits_length, _ = logits.shape
             outputs = []
             for head in range(matrix.shape[0]):
                 flat = logits[:, head].reshape(-1, logits.shape[-1]).T
@@ -171,9 +173,23 @@ def evaluate_gqa_recall(target, distances=(128, 256, 512, 1024), *, use_flash=Fa
         # feature matrices have diverged during distillation.
         feature_query = target._feature(query, target.feature_q_weight)
         feature_key = target._feature(key, target.feature_k_weight)
+        control_hidden = torch.randn(
+            batch,
+            length,
+            target.config.hidden_size,
+            generator=torch.Generator().manual_seed(4096 + distance),
+        ).to(device=weight.device, dtype=weight.dtype)
+        delta = target._shift_delta(control_hidden)
+        controls = target._dynamics(control_hidden, delta)
+        source_values = values
+        values, _ = target._mix_values(
+            control_hidden, delta, values, torch.zeros_like(control_hidden)
+        )
         recurrence = target._state_training if use_flash else target._state_reference
-        numerator, denominator = recurrence(feature_query, feature_key, values)
-        recalled = numerator[:, :, -1] / denominator[:, :, -1, None].clamp_min(1e-12)
+        numerator, denominator = recurrence(feature_query, feature_key, values, controls)
+        recalled = target._heads(
+            numerator, denominator, feature_query, feature_key, values, controls
+        )[:, :, -1]
         metrics[f"recall_{distance}_hit_at_1"] = float((recalled.argmax(-1) == 0).float().mean())
         # The frozen source teacher is represented by the synthetic logits
         # themselves, so its hit remains an oracle even when the student
@@ -181,7 +197,7 @@ def evaluate_gqa_recall(target, distances=(128, 256, 512, 1024), *, use_flash=Fa
         teacher_scores = torch.einsum(
             "bhf,bhtf->bht", query_logits[:, :, -1].float(), key_logits.float()
         )
-        exact = torch.einsum("bht,bhtd->bhd", teacher_scores.softmax(-1), values.float())
+        exact = torch.einsum("bht,bhtd->bhd", teacher_scores.softmax(-1), source_values.float())
         metrics[f"teacher_recall_{distance}_hit_at_1"] = float(
             (exact.argmax(-1) == 0).float().mean()
         )

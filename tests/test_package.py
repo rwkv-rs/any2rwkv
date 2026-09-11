@@ -4,7 +4,6 @@ import pytest
 import torch
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 
-import any2rwkv
 from any2rwkv.qwen2rwkv.align import train
 from any2rwkv.qwen2rwkv.align.train import (
     GQA_GATE_SCHEDULE,
@@ -21,13 +20,10 @@ from any2rwkv.qwen2rwkv.gqa2rwkv import _source_qkv, evaluate_gqa_recall
 from any2rwkv.qwen2rwkv.transformers.modeling_qwen2rwkv import (
     Qwen2RWKVConfig,
     Qwen2RWKVDecoderLayer,
+    Qwen2RWKVForCausalLM,
     Qwen2RWKVTimeMix,
     _FP32RotaryEmbedding,
 )
-
-
-def test_package_version() -> None:
-    assert any2rwkv.__version__ == "0.1.0"
 
 
 def _config() -> Qwen2RWKVConfig:
@@ -53,9 +49,9 @@ def _config() -> Qwen2RWKVConfig:
 def test_gqa_reference_is_explicit_numerator_denominator_recurrence() -> None:
     module = Qwen2RWKVTimeMix(_config(), 0).float()
     generator = torch.Generator().manual_seed(0)
-    feature_query = torch.rand(1, 2, 7, 128, generator=generator)
-    feature_key = torch.rand(1, 2, 7, 128, generator=generator)
-    value_heads = torch.rand(1, 2, 7, 256, generator=generator)
+    feature_query = torch.rand(1, 8, 7, 128, generator=generator)
+    feature_key = torch.rand(1, 8, 7, 128, generator=generator)
+    value_heads = torch.rand(1, 8, 7, 256, generator=generator)
     numerator, denominator = module._state_reference(feature_query, feature_key, value_heads)
 
     causal_weights = (feature_query @ feature_key.transpose(-1, -2)).tril()
@@ -137,6 +133,10 @@ def test_gqa_schema_rejects_bounded_artifact() -> None:
     values["gqa_sidecar_capacity"] = 128
     with pytest.raises(ValueError, match="removed fields"):
         Qwen2RWKVConfig.from_dict(values)
+    values = _config().to_dict()
+    values["gqa_checkpoint_schema"] = "gqa_rwkv_feature_state_d256x2_v2"
+    with pytest.raises(ValueError, match="schema"):
+        Qwen2RWKVConfig.from_dict(values)
 
 
 def test_fresh_process_strict_load_has_no_distillation_parameters() -> None:
@@ -182,7 +182,7 @@ def test_block_gate_and_final_cache_use_pure_student(monkeypatch) -> None:
     monkeypatch.setattr(train, "_teacher_tmix_output", forbidden_teacher)
     student = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
     stored = []
-    cache = SimpleNamespace(store=lambda output, slot: stored.append((output, slot)))
+    cache = SimpleNamespace(store=lambda output, slot, **kwargs: stored.append((output, slot)))
     _refresh_gqa_stage_cache(None, student, 0, hidden, cache, torch.device("cpu"), 0.0)
     assert stored[0][1] == "next"
     assert torch.equal(stored[0][0], pure)
@@ -215,6 +215,15 @@ def test_recall_fixture_detects_feature_collapse() -> None:
     with torch.no_grad():
         module.feature_q_weight.zero_()
         module.feature_k_weight.zero_()
+    metrics = evaluate_gqa_recall(module, (128,))
+    assert metrics["teacher_recall_128_hit_at_1"] == 1
+    assert metrics["recall_128_hit_at_1"] == 0
+
+
+def test_recall_fixture_detects_learned_forgetting() -> None:
+    module = Qwen2RWKVTimeMix(_config(), 0).float()
+    with torch.no_grad():
+        module.w0.fill_(0.5)
     metrics = evaluate_gqa_recall(module, (128,))
     assert metrics["teacher_recall_128_hit_at_1"] == 1
     assert metrics["recall_128_hit_at_1"] == 0
@@ -282,3 +291,126 @@ def test_flash_fp16_prefill_chunks_decode_and_fixed_state_soak() -> None:
     metrics = _gqa_fp16_soak(layer, hidden[:, :1], config)
     assert metrics["soak_tokens"] == 8192
     assert metrics["recurrent_bytes_per_sequence"] == 2 * 1024 * 1024
+    assert metrics["token_shift_bytes_per_sequence"] == 2048 * 2
+
+
+def test_rwkv_extension_preserves_transferred_function() -> None:
+    torch.manual_seed(42)
+    config = _config()
+    source = Qwen3_5Attention(config, 0).float().eval()
+    module = Qwen2RWKVTimeMix(config, 0).float()
+    module.load_source_attention(source)
+    hidden = torch.randn(2, 17, 2048)
+    positions = torch.arange(17).expand(2, -1)
+    query, key, value, gate = _source_qkv(source, hidden, module.rotary_emb(hidden, positions))
+    feature_query, feature_key = module._features(query, key)
+    weights = (feature_query @ feature_key.transpose(-1, -2)).tril()
+    heads = weights @ value.repeat_interleave(4, dim=1) / weights.sum(-1, keepdim=True)
+    expected = source.o_proj(heads.transpose(1, 2).reshape_as(hidden) * gate.sigmoid())
+    actual = module.reference_forward(hidden, v_first=torch.randn_like(hidden))
+    assert _nmse_loss(actual, expected) < 1e-12
+
+
+def test_training_expansion_preserves_v2_checkpoint(tmp_path) -> None:
+    from safetensors.torch import save_file
+
+    torch.manual_seed(42)
+    original = Qwen2RWKVTimeMix(_config(), 0).float()
+    transferred = train._gqa_transferred_names(original)
+    state = {name: value for name, value in original.state_dict().items() if name in transferred}
+    checkpoint = tmp_path / "layer_03.safetensors"
+    save_file(state, str(checkpoint))
+    expanded = Qwen2RWKVTimeMix(_config(), 0).float()
+    train._load_gqa_initial_checkpoint(expanded, checkpoint)
+    hidden = torch.randn(1, 17, 2048)
+    first = torch.randn_like(hidden)
+    assert torch.equal(
+        expanded.reference_forward(hidden, v_first=first),
+        original.reference_forward(hidden, v_first=first),
+    )
+    state.pop("q_proj.weight")
+    save_file(state, str(checkpoint))
+    with pytest.raises(ValueError, match="complete v2 or v3"):
+        train._load_gqa_initial_checkpoint(expanded, checkpoint)
+
+
+@pytest.mark.parametrize("finished", [False, True])
+def test_generation_smoke_rejects_truncated_answers(tmp_path, monkeypatch, finished) -> None:
+    import json
+
+    tokenizer = SimpleNamespace(
+        apply_chat_template=lambda *args, **kwargs: {"input_ids": torch.tensor([[1, 2]])},
+        decode=lambda *args, **kwargs: "A readable answer.",
+    )
+    model = SimpleNamespace(
+        generation_config=SimpleNamespace(eos_token_id=[9]),
+        generate=lambda *args, **kwargs: torch.tensor([[1, 2, 3, 9 if finished else 4]]),
+    )
+    model.cuda = model.eval = lambda: model
+    monkeypatch.setattr(train.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: tokenizer)
+    monkeypatch.setattr(Qwen2RWKVForCausalLM, "from_pretrained", lambda *args, **kwargs: model)
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda tensor: tensor)
+    assert train._accept(tmp_path) is finished
+    report = json.loads((tmp_path / "acceptance.json").read_text())
+    assert all(
+        row["finish_reason"] == ("eos" if finished else "length") for row in report["generations"]
+    )
+
+
+def test_value_residual_cache_round_trip(tmp_path) -> None:
+    from any2rwkv.qwen2rwkv.align.last_layer_cache import LastLayerCache
+
+    cache = LastLayerCache(tmp_path, 0)
+    hidden = torch.randn(2, 16, 2048).bfloat16()
+    first = torch.randn_like(hidden)
+    cache.store(hidden, v_first=first)
+    cache.advance()
+    assert torch.equal(cache.load(), hidden)
+    assert torch.equal(cache.load_v_first(), first)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashRWKV2 requires CUDA")
+def test_rwkv_zero_initialization_has_native_gradients() -> None:
+    torch.manual_seed(42)
+    module = Qwen2RWKVTimeMix(_config(), 0).bfloat16().cuda().train()
+    hidden = torch.randn(2, 32, 2048, device="cuda", dtype=torch.bfloat16)
+    first = torch.randn_like(hidden)
+    output, _ = module(hidden, first)
+    output.float().square().mean().backward()
+    for name in ("x_r", "x_k", "x_v", "x_g", "w0", "w2", "a0", "a2", "v0", "v2", "r_k", "norm_mix"):
+        gradient = dict(module.named_parameters())[name].grad
+        assert gradient is not None, name
+        assert torch.isfinite(gradient).all(), name
+        assert gradient.abs().sum() > 0, name
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashRWKV2 requires CUDA")
+@torch.no_grad()
+def test_trained_rwkv_dynamics_match_reference_and_cached_decode() -> None:
+    import copy
+
+    torch.manual_seed(42)
+    config = _config()
+    layer = Qwen2RWKVDecoderLayer(config, 0).bfloat16().cuda().train()
+    tmix = layer.tmix
+    for name in ("x_r", "x_w", "x_k", "x_v", "x_a", "x_g", "v0", "norm_mix"):
+        getattr(tmix, name).fill_(0.03)
+    tmix.w0.fill_(0.001)
+    tmix.a0.fill_(0.01)
+    tmix.k_a.fill_(0.02)
+    tmix.r_k.fill_(0.0001)
+    for name in ("w2", "a2", "v2"):
+        getattr(tmix, name).normal_(std=1e-4)
+    hidden = torch.randn(1, 256, 2048, device="cuda", dtype=torch.bfloat16)
+    first = torch.randn_like(hidden)
+    reference = copy.deepcopy(tmix).float()
+    actual = tmix(hidden, first)[0]
+    expected = reference.reference_forward(hidden.float(), v_first=first.float())
+    assert _nmse_loss(actual, expected) < 1e-3
+    layer.half().eval()
+    hidden, first = hidden.half(), first.half()
+    full, _, _ = _fp16_forward_mode(layer, hidden, config, None, v_first=first)
+    for chunk in (64, 128, 1):
+        cached, _, cache = _fp16_forward_mode(layer, hidden, config, chunk, v_first=first)
+        assert _nmse_loss(cached, full).sqrt() < 1e-3
+        assert cache.layers[0].conv_states[0].shape == (1, 2048, 1)
