@@ -6,11 +6,11 @@
 
 实现位于：
 
-- [`gdn2rwkv.py`](../src/any2rwkv/qwen2rwkv/gdn2rwkv.py)：严格复制检查、解析
+- [`gdn2rwkv.py`](../src/any2rwkv/qwen2rwkv/qwen3_5/gdn2rwkv.py)：严格复制检查、解析
   recurrence 自检和 Clamp-W 诊断；
-- [`modeling_qwen2rwkv.py`](../src/any2rwkv/qwen2rwkv/transformers/modeling_qwen2rwkv.py)：
+- [`modeling_qwen2rwkv.py`](../src/any2rwkv/qwen2rwkv/qwen3_5/transformers/modeling_qwen2rwkv.py)：
   hybrid GDN runtime、Conv/WKV cache 和 FlashRWKV2 调用；
-- [`train.py`](../src/any2rwkv/qwen2rwkv/align/train.py)：逐层蒸馏、checkpoint schema
+- [`train.py`](../src/any2rwkv/qwen2rwkv/qwen3_5/align/train.py)：逐层蒸馏、checkpoint schema
   检查以及统一验证集验收。
 
 ## 1. 保留的原 GDN 边界

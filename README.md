@@ -49,7 +49,7 @@ The project uses [uv](https://docs.astral.sh/uv/) and a `src` package layout.
 
 ```bash
 uv sync
-uv run python -m any2rwkv.qwen2rwkv.align.train \
+uv run python -m any2rwkv.qwen2rwkv.qwen3_5.align.train \
   --source /home/caizus/Weights/Qwen/Qwen3.5-2B \
   --output /path/to/Qwen3.5-2B-RWKV \
   --agentic nvidia/Nemotron-SFT-Agentic-v2 \

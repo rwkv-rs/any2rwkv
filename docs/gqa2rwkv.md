@@ -118,7 +118,7 @@ Gate=0 的 `gqa_candidate.safetensors` 是可供重放验收的研究候选。�
 输出目录，然后执行：
 
 ```bash
-uv run python -m any2rwkv.qwen2rwkv.align.train \
+uv run python -m any2rwkv.qwen2rwkv.qwen3_5.align.train \
   --source /path/to/Qwen3.5-2B \
   --output /path/to/new-experiment \
   --through-layer 3 \

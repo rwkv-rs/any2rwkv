@@ -456,7 +456,7 @@ def _fresh_process_gqa_strict_load(config, layer_idx: int, tmix) -> None:
             (
                 "import sys",
                 "from safetensors.torch import load_file",
-                "from any2rwkv.qwen2rwkv.transformers.modeling_qwen2rwkv import (",
+                "from any2rwkv.qwen2rwkv.qwen3_5.transformers.modeling_qwen2rwkv import (",
                 "    Qwen2RWKVConfig, Qwen2RWKVTimeMix)",
                 "config = Qwen2RWKVConfig.from_json_file(sys.argv[1])",
                 "module = Qwen2RWKVTimeMix(config, int(sys.argv[3])).half().eval()",
@@ -1490,7 +1490,7 @@ def _fresh_acceptance(output: Path) -> bool:
     command = [
         sys.executable,
         "-m",
-        "any2rwkv.qwen2rwkv.align.train",
+        "any2rwkv.qwen2rwkv.qwen3_5.align.train",
         "--accept-only",
         "--output",
         output.as_posix(),
@@ -1713,7 +1713,7 @@ def main():
             "torch.distributed.run",
             "--nproc-per-node=8",
             "-m",
-            "any2rwkv.qwen2rwkv.align.train",
+            "any2rwkv.qwen2rwkv.qwen3_5.align.train",
             *sys.argv[1:],
         ]
         raise SystemExit(subprocess.run(command, check=False).returncode)

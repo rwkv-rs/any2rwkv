@@ -4,8 +4,8 @@ import pytest
 import torch
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 
-from any2rwkv.qwen2rwkv.align import train
-from any2rwkv.qwen2rwkv.align.train import (
+from any2rwkv.qwen2rwkv.qwen3_5.align import train
+from any2rwkv.qwen2rwkv.qwen3_5.align.train import (
     GQA_GATE_SCHEDULE,
     _fp16_forward_mode,
     _fresh_process_gqa_strict_load,
@@ -16,8 +16,8 @@ from any2rwkv.qwen2rwkv.align.train import (
     _refresh_gqa_stage_cache,
     _require_gqa_acceptance,
 )
-from any2rwkv.qwen2rwkv.gqa2rwkv import _source_qkv, evaluate_gqa_recall
-from any2rwkv.qwen2rwkv.transformers.modeling_qwen2rwkv import (
+from any2rwkv.qwen2rwkv.qwen3_5.gqa2rwkv import _source_qkv, evaluate_gqa_recall
+from any2rwkv.qwen2rwkv.qwen3_5.transformers.modeling_qwen2rwkv import (
     Qwen2RWKVConfig,
     Qwen2RWKVDecoderLayer,
     Qwen2RWKVForCausalLM,
@@ -358,7 +358,7 @@ def test_generation_smoke_rejects_truncated_answers(tmp_path, monkeypatch, finis
 
 
 def test_value_residual_cache_round_trip(tmp_path) -> None:
-    from any2rwkv.qwen2rwkv.align.last_layer_cache import LastLayerCache
+    from any2rwkv.qwen2rwkv.qwen3_5.align.last_layer_cache import LastLayerCache
 
     cache = LastLayerCache(tmp_path, 0)
     hidden = torch.randn(2, 16, 2048).bfloat16()
