@@ -22,8 +22,9 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, TensorDataset
 from transformers import AutoTokenizer
 
-from ..gdn2rwkv import initialize_gdn_layer
+from ..gdn2rwkv import audit_gdn_layer, initialize_gdn_layer
 from ..gqa2rwkv import (
+    audit_gqa_layer,
     evaluate_gqa_recall,
     initialize_gqa_layer,
 )
@@ -95,6 +96,116 @@ def _teacher_tmix_output(source_text, layer_idx, hidden):
         attention_mask=_causal(normalized),
         past_key_values=None,
     )[0]
+
+
+@torch.no_grad()
+def _audit_source_activations(source_text, input_ids, device):
+    """Materialize the 24 source layer inputs without writing an activation artifact."""
+    hidden = source_text.embed_tokens(input_ids.to(device)).float()
+    activations = []
+    for layer_idx, _layer in enumerate(source_text.layers):
+        activations.append(hidden.detach().cpu())
+        hidden = _teacher_layer(source_text, layer_idx, hidden).float()
+    return activations
+
+
+@torch.no_grad()
+def audit_qwen3_5_2b(
+    source: str,
+    output: str,
+    agentic: str = "nvidia/Nemotron-SFT-Agentic-v2",
+    math_dataset: str = "nvidia/Nemotron-SFT-Math-v4",
+):
+    """Run Stage -1 only; no target model, checkpoint, training, or runtime path is touched."""
+    output_path = Path(output).resolve()
+    if output_path == Path(source).resolve():
+        raise ValueError("audit output must not overwrite the source checkpoint")
+    output_path.mkdir(parents=True, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained(source)
+    packed_path = output_path / "packed_sequences.pt"
+    if packed_path.is_file():
+        input_ids = torch.load(packed_path, map_location="cpu", weights_only=True)
+        if isinstance(input_ids, dict):
+            input_ids = input_ids["input_ids"]
+    else:
+        input_ids = build_packed_sequences(
+            tokenizer, agentic, math_dataset, count=24, context_length=512
+        ).input_ids
+    if input_ids.ndim != 2 or input_ids.shape[0] < 24 or input_ids.shape[1] != 512:
+        raise ValueError(
+            f"Stage -1 requires at least 24 packed rows of length 512; got {tuple(input_ids.shape)}"
+        )
+    input_ids = input_ids[:24].contiguous()
+    source_outer, source_text = load_qwen_teacher(source, torch.float32, device)
+    del source_outer
+    source_text.eval()
+    activations = _audit_source_activations(source_text, input_ids, device)
+    records = {"gdn": [], "gqa": []}
+    for layer_idx, source_layer in enumerate(source_text.layers):
+        init_hidden = activations[layer_idx][:8].to(device)
+        validation_hidden = activations[layer_idx][8:24].to(device)
+        if source_text.config.layer_types[layer_idx] == "linear_attention":
+            audit = audit_gdn_layer(
+                source_layer.linear_attn,
+                source_layer,
+                init_hidden,
+                validation_hidden,
+            )
+            records["gdn"].append(audit)
+        else:
+            init_normalized = source_layer.input_layernorm(init_hidden)
+            validation_normalized = source_layer.input_layernorm(validation_hidden)
+            _, init_embeddings = _position(source_text, init_normalized)
+            _, validation_embeddings = _position(source_text, validation_normalized)
+            audit = audit_gqa_layer(
+                source_layer.self_attn,
+                source_layer,
+                init_hidden,
+                validation_hidden,
+                init_embeddings,
+                validation_embeddings,
+            )
+            records["gqa"].append(audit)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    token_digest = hashlib.sha256(input_ids.numpy().tobytes()).hexdigest()
+    result = {
+        "schema": "canonical_stage_minus_1_audit_v1",
+        "source": str(Path(source).resolve()),
+        "device": str(device),
+        "dtype": "float32",
+        "geometry": {
+            "layers": 24,
+            "gdn_layers": 18,
+            "gqa_layers": 6,
+            "canonical_head_size": 128,
+            "canonical_heads": 16,
+            "source_gqa_head_size": 256,
+        },
+        "activation": {
+            "rows": 24,
+            "initialization_rows": [0, 8],
+            "validation_rows": [8, 24],
+            "tokens_per_row": int(input_ids.shape[1]),
+            "token_sha256": token_digest,
+            "packed_sequences": str(packed_path) if packed_path.is_file() else "in_memory_build",
+            "agentic_dataset": agentic,
+            "math_dataset": math_dataset,
+        },
+        "nmse": "same normalized squared error as the existing _nmse helpers",
+        "gdn": records["gdn"],
+        "gqa": records["gqa"],
+    }
+    audit_path = output_path / "audit.json"
+    audit_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(
+        json.dumps(
+            {"audit": str(audit_path), "gdn_layers": 18, "gqa_layers": 6}, ensure_ascii=False
+        ),
+        flush=True,
+    )
+    return audit_path
 
 
 def _student_tmix_output(student, layer_idx, hidden, v_first=None):
@@ -1680,6 +1791,11 @@ def main():
     parser.add_argument("--agentic", default="nvidia/Nemotron-SFT-Agentic-v2")
     parser.add_argument("--math", dest="math_dataset", default="nvidia/Nemotron-SFT-Math-v4")
     parser.add_argument("--accept-only", action="store_true")
+    parser.add_argument(
+        "--audit-only",
+        action="store_true",
+        help="run Stage -1 FP32 component audit and write only output/audit.json",
+    )
     parser.add_argument("--global-kl-only", action="store_true")
     parser.add_argument("--through-layer", type=int, default=23)
     parser.add_argument("--gqa-prefix-cache")
@@ -1706,6 +1822,9 @@ def main():
         raise SystemExit(0 if _accept(Path(args.output)) else 1)
     if args.source is None:
         parser.error("--source is required for conversion")
+    if args.audit_only:
+        audit_qwen3_5_2b(args.source, args.output, args.agentic, args.math_dataset)
+        return
     if "WORLD_SIZE" not in os.environ:
         command = [
             sys.executable,
