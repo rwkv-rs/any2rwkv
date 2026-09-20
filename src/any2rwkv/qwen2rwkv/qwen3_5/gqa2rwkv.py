@@ -422,6 +422,110 @@ def _gqa_teacher_attention(
     return source.o_proj(mixed).float(), heads
 
 
+@torch.no_grad()
+def initialize_gqa_scaffold(
+    source,
+    target,
+    init_hidden: torch.Tensor,
+    init_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+):
+    """Fill the T1 endpoint using Q1--Q3 and the accepted E3/E4 fits."""
+    hidden = init_hidden.float()
+    parts = _gqa_source_components(source, hidden, init_position_embeddings)
+    identity = _gqa_identity_feature_weight(8, 256, 64, hidden.device)
+    feature_q = _gqa_feature(parts["q_norm_rope"], identity)
+    feature_k = _gqa_feature(parts["k_norm_rope"], identity)
+    projection_q = _gqa_fit_linear_feature(parts["q_norm_rope"], feature_q)
+    projection_k = _gqa_fit_linear_feature(parts["k_norm_rope"], feature_k)
+    q_scale = _gqa_geometric(parts["q_norm_scale"])
+    k_scale = _gqa_geometric(parts["k_norm_scale"])
+    q_gamma = 1.0 + source.q_norm.weight.float()
+    k_gamma = 1.0 + source.k_norm.weight.float()
+    q_projection = source.q_proj.weight.float().view(8, 2, 256, -1)[:, 0]
+    gate_projection = source.q_proj.weight.float().view(8, 2, 256, -1)[:, 1]
+    k_projection = source.k_proj.weight.float().view(2, 256, -1)
+    v_projection = source.v_proj.weight.float().view(2, 256, -1)
+    receptance = torch.zeros(2048, 2048, device=hidden.device)
+    key = torch.zeros_like(receptance)
+    value = torch.zeros_like(receptance)
+    for head in range(8):
+        q_map = projection_q[head] * (q_gamma / q_scale[head]).view(-1, 1)
+        k_map = projection_k[head] * (k_gamma / k_scale[head]).view(-1, 1)
+        q_rows = q_map.T @ q_projection[head]
+        k_rows = k_map.T @ k_projection[head // 4]
+        receptance[2 * head * 128 : (2 * head + 1) * 128] = q_rows
+        receptance[(2 * head + 1) * 128 : (2 * head + 2) * 128] = q_rows
+        key[2 * head * 128 : (2 * head + 1) * 128] = k_rows
+        key[(2 * head + 1) * 128 : (2 * head + 2) * 128] = k_rows
+        value[2 * head * 128 : (2 * head + 1) * 128] = v_projection[head // 4, :128]
+        value[(2 * head + 1) * 128 : (2 * head + 2) * 128] = v_projection[head // 4, 128:]
+
+    q_canonical = F.linear(hidden, receptance).view(hidden.shape[0], hidden.shape[1], 16, 128)
+    k_canonical = F.linear(hidden, key).view(hidden.shape[0], hidden.shape[1], 16, 128)
+    v_canonical = F.linear(hidden, value).view(hidden.shape[0], hidden.shape[1], 16, 128)
+    q_canonical = q_canonical.transpose(1, 2)
+    k_canonical = k_canonical.transpose(1, 2)
+    v_canonical = v_canonical.transpose(1, 2)
+    numerator, _ = _gqa_recurrent(q_canonical, k_canonical, v_canonical, -30.0)
+    flat = numerator.transpose(1, 2).reshape(-1, 2048)
+    unit = torch.ones(2048, device=hidden.device, dtype=torch.float32)
+    normalized = F.group_norm(
+        flat, 16, weight=unit, bias=torch.zeros_like(unit), eps=64e-5
+    ).view_as(numerator)
+    teacher_heads = _gqa_teacher_attention(
+        source,
+        parts["q_norm_rope"],
+        parts["k_norm_rope"],
+        parts["value"],
+        parts["gate"],
+    )[1]
+    target_heads = teacher_heads.view(hidden.shape[0], 8, hidden.shape[1], 2, 128)
+    target_heads = target_heads.permute(0, 1, 3, 2, 4).reshape(
+        hidden.shape[0], 16, hidden.shape[1], 128
+    )
+    affine_weight, affine_bias, affine_fit_nmse = _gqa_fit_channel_affine(normalized, target_heads)
+
+    state = {}
+    for name in ("x_r", "x_w", "x_k", "x_v", "x_a", "x_g"):
+        state[name] = torch.zeros_like(getattr(target, name))
+    state["w0"] = torch.full_like(target.w0, -12.0)
+    state["w1"] = torch.zeros_like(target.w1)
+    state["w2"] = torch.zeros_like(target.w2)
+    state["a0"] = torch.full_like(target.a0, -12.0)
+    state["a1"] = torch.zeros_like(target.a1)
+    state["a2"] = torch.zeros_like(target.a2)
+    state["v0"] = torch.full_like(target.v0, -8.0)
+    state["v1"] = torch.zeros_like(target.v1)
+    state["v2"] = torch.zeros_like(target.v2)
+    state["g1"] = gate_projection.reshape(2048, 2048).T
+    state["g2"] = torch.eye(2048, device=hidden.device)
+    state["k_k"] = torch.ones_like(target.k_k)
+    state["k_a"] = torch.zeros_like(target.k_a)
+    state["r_k"] = torch.zeros_like(target.r_k)
+    state["receptance.weight"] = receptance
+    state["key.weight"] = key
+    state["value.weight"] = value
+    state["output.weight"] = source.o_proj.weight.float()
+    state["ln_x.weight"] = affine_weight
+    state["ln_x.bias"] = affine_bias
+    target.load_canonical_state_dict(state)
+    return {
+        "q_norm_geometric_constant": list(q_scale.tolist()),
+        "k_norm_geometric_constant": list(k_scale.tolist()),
+        "linear_feature_q_fit_nmse": _nmse(
+            _gqa_linear_feature(parts["q_norm_rope"], projection_q), feature_q
+        ),
+        "linear_feature_k_fit_nmse": _nmse(
+            _gqa_linear_feature(parts["k_norm_rope"], projection_k), feature_k
+        ),
+        "e4_affine_fit_nmse": affine_fit_nmse,
+        "w0": -12.0,
+        "a0": -12.0,
+        "v0": -8.0,
+        "v3_checkpoint": False,
+    }
+
+
 def _gqa_geometry_check(query, key, value, decay_logit: float) -> float:
     batch, heads, length, features = query.shape
     width = value.shape[-1]
@@ -718,4 +822,5 @@ __all__ = [
     "evaluate_gqa_recall",
     "exact_gqa_attention",
     "initialize_gqa_layer",
+    "initialize_gqa_scaffold",
 ]

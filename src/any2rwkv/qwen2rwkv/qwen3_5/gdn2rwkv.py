@@ -396,13 +396,20 @@ def _gdn_metric(source_layer, hidden, source_tmix, candidate_tmix) -> dict[str, 
     }
 
 
-def _gdn_fit_erase(source, hidden: torch.Tensor) -> dict[str, torch.Tensor]:
+def _gdn_fit_erase(
+    source, hidden: torch.Tensor, *, canonical: bool = False
+) -> dict[str, torch.Tensor]:
     beta_logits = source.in_proj_b(hidden).float()
     decay_logits = source.in_proj_a(hidden).float()
     beta = beta_logits.sigmoid()
     log_decay = -source.A_log.float().exp() * F.softplus(decay_logits + source.dt_bias.float())
     target = torch.logit((beta * log_decay.exp()).clamp(1e-6, 1 - 1e-6))
-    design = torch.cat((torch.ones_like(beta_logits[..., :1]), beta_logits, decay_logits), dim=-1)
+    features = (
+        (beta_logits.tanh(), decay_logits.tanh())
+        if canonical
+        else (beta_logits, decay_logits)
+    )
+    design = torch.cat((torch.ones_like(beta_logits[..., :1]), *features), dim=-1)
     coefficient = _gdn_normal_fit(
         design.reshape(-1, design.shape[-1]), target.reshape(-1, target.shape[-1])
     ).transpose(0, 1)
@@ -413,10 +420,21 @@ def _gdn_fit_erase(source, hidden: torch.Tensor) -> dict[str, torch.Tensor]:
     }
 
 
-def _gdn_apply_erase(source, hidden: torch.Tensor, fitted: dict[str, torch.Tensor]):
+def _gdn_apply_erase(
+    source,
+    hidden: torch.Tensor,
+    fitted: dict[str, torch.Tensor],
+    *,
+    canonical: bool = False,
+):
     beta_logits = source.in_proj_b(hidden).float()
     decay_logits = source.in_proj_a(hidden).float()
-    design = torch.cat((torch.ones_like(beta_logits[..., :1]), beta_logits, decay_logits), dim=-1)
+    features = (
+        (beta_logits.tanh(), decay_logits.tanh())
+        if canonical
+        else (beta_logits, decay_logits)
+    )
+    design = torch.cat((torch.ones_like(beta_logits[..., :1]), *features), dim=-1)
     return (design @ torch.cat((fitted["a0"].unsqueeze(0), fitted["a2"]), dim=0)).sigmoid()
 
 
@@ -477,6 +495,127 @@ def _gdn_fit_front_params(source, hidden: torch.Tensor, frontend: torch.Tensor):
     return params, segments
 
 
+@torch.no_grad()
+def initialize_gdn_scaffold(source, target, init_hidden: torch.Tensor):
+    """Fill a ScaffoldTimeMix GDN endpoint from the accepted D4--D11 fits."""
+    hidden = init_hidden.float()
+    frontend = _gdn_front(source, hidden)[0].float()
+    fit_params, segment_defs = _gdn_fit_front_params(source, hidden, frontend)
+    erase_fit = _gdn_fit_erase(source, hidden, canonical=True)
+    alpha_grid = (0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0)
+    decay_fit = _gdn_fit_decay(source, hidden, alpha_grid)
+    gate_scale = _gdn_gate_scale(source, hidden)
+    closed_front = torch.cat(
+        [
+            _gdn_apply_shift(
+                hidden, fit_params[name]["closed"]["weight"], fit_params[name]["closed"]["mu"]
+            )
+            for name, _ in segment_defs
+        ],
+        dim=-1,
+    )
+    closed_parts = _gdn_components(source, hidden, closed_front)
+    canonical_rho = _gdn_geometric(
+        torch.rsqrt(closed_parts["query_raw"].square().sum(-1) + 1e-6)
+        / math.sqrt(source.head_k_dim)
+    )
+    key_norm = torch.sqrt(closed_parts["key_raw"].square().sum(-1) + 1e-6)
+    source_a = closed_parts["beta"] * closed_parts["log_decay"].exp()
+    ka_grid = (0.0, 0.25, 0.5, 0.75, 1.0)
+    variances = []
+    for ka in ka_grid:
+        factor = 1 + (source_a - 1) * ka
+        gamma = closed_parts["beta"] / (key_norm * factor)
+        variances.append(gamma.log().var(dim=(0, 1), unbiased=False))
+    variance_grid = torch.stack(variances)
+    selected_ka = torch.tensor(
+        [ka_grid[index] for index in variance_grid.argmin(0).tolist()],
+        device=hidden.device,
+        dtype=torch.float32,
+    )
+    fitted_a = _gdn_apply_erase(source, hidden, erase_fit, canonical=True)
+    fitted_factor = 1 + (fitted_a - 1) * selected_ka.view(1, 1, -1)
+    canonical_gamma = _gdn_geometric(closed_parts["beta"] / (key_norm * fitted_factor))
+
+    raw = _gdn_trace(source, hidden)["oracle_raw"]
+    flat = raw.reshape(-1, source.value_dim).float()
+    unit = torch.ones(source.value_dim, device=hidden.device, dtype=torch.float32)
+    group_base = F.group_norm(
+        flat,
+        source.num_v_heads,
+        weight=unit,
+        bias=torch.zeros_like(unit),
+        eps=64e-5,
+    ).view(raw.shape[0], raw.shape[1], source.num_v_heads, source.head_v_dim)
+    rms_target = (
+        raw
+        * torch.rsqrt(raw.square().mean(-1, keepdim=True) + source.norm.variance_epsilon)
+        * source.norm.weight.float().view(1, 1, 1, source.head_v_dim)
+    )
+    norm_weight, norm_bias, norm_fit_nmse = _gdn_fit_channel_affine(
+        group_base.reshape(raw.shape[0], raw.shape[1], -1),
+        rms_target.reshape(raw.shape[0], raw.shape[1], -1),
+    )
+
+    state = {}
+    zero = torch.zeros_like(target.x_r)
+    for name in ("x_r", "x_w", "x_k", "x_v", "x_a", "x_g"):
+        state[name] = zero.clone()
+    state["x_r"] = fit_params["q"]["closed"]["mu"].view(1, 1, -1)
+    state["x_k"] = fit_params["k"]["closed"]["mu"].view(1, 1, -1)
+    state["x_v"] = fit_params["v"]["closed"]["mu"].view(1, 1, -1)
+    state["w0"] = decay_fit["w0"].repeat_interleave(source.head_v_dim).view(1, 1, -1)
+    state["w1"] = torch.zeros_like(target.w1)
+    state["w2"] = torch.zeros_like(target.w2)
+    for head in range(source.num_v_heads):
+        source_a_weight = source.in_proj_a.weight[head].float()
+        start = head * len(alpha_grid)
+        state["w1"][:, start : start + len(alpha_grid)] = (
+            source_a_weight[:, None] * decay_fit["alpha"][None, :]
+        )
+        state["w2"][
+            start : start + len(alpha_grid),
+            head * source.head_v_dim : (head + 1) * source.head_v_dim,
+        ] = decay_fit["w2"][:, head, None]
+    state["a0"] = erase_fit["a0"].repeat_interleave(source.head_v_dim).view(1, 1, -1)
+    state["a1"] = torch.zeros_like(target.a1)
+    state["a1"][:, : source.num_v_heads] = source.in_proj_b.weight.float().T
+    state["a1"][:, source.num_v_heads : 2 * source.num_v_heads] = source.in_proj_a.weight.float().T
+    state["a2"] = torch.zeros_like(target.a2)
+    for head in range(source.num_v_heads):
+        channels = slice(head * source.head_v_dim, (head + 1) * source.head_v_dim)
+        state["a2"][:, channels] = erase_fit["a2"][:, head, None]
+    state["v0"] = torch.full_like(target.v0, -8.0)
+    state["v1"] = torch.zeros_like(target.v1)
+    state["v2"] = torch.zeros_like(target.v2)
+    state["g1"] = torch.zeros_like(target.g1)
+    state["g1"][:, : source.in_proj_z.weight.shape[0]] = source.in_proj_z.weight.float().T
+    state["g2"] = torch.diag(gate_scale).to(dtype=target.g2.dtype, device=target.g2.device)
+    state["k_k"] = torch.ones_like(target.k_k)
+    state["k_a"] = selected_ka.repeat_interleave(source.head_v_dim).view(1, 1, -1)
+    state["r_k"] = torch.zeros_like(target.r_k)
+    state["receptance.weight"] = fit_params["q"]["closed"][
+        "weight"
+    ] * canonical_rho.repeat_interleave(source.head_v_dim).view(-1, 1)
+    state["key.weight"] = fit_params["k"]["closed"]["weight"]
+    state["value.weight"] = fit_params["v"]["closed"]["weight"] * canonical_gamma.repeat_interleave(
+        source.head_v_dim
+    ).view(-1, 1)
+    state["output.weight"] = source.out_proj.weight.float()
+    state["ln_x.weight"] = norm_weight
+    state["ln_x.bias"] = norm_bias
+    target.load_canonical_state_dict(state)
+    return {
+        "alpha_grid": list(alpha_grid),
+        "selected_k_a": list(selected_ka.tolist()),
+        "canonical_rho": list(canonical_rho.tolist()),
+        "canonical_gamma": list(canonical_gamma.tolist()),
+        "d10_affine_fit_nmse": norm_fit_nmse,
+        "v0": -8.0,
+        "r_k_zero": True,
+    }
+
+
 def _gdn_front_with_params(hidden, params, segments, mode, names=None):
     if names is None:
         names = {name for name, _ in segments}
@@ -518,6 +657,9 @@ def audit_gdn_layer(
         source, normalized["initialization"], source_front["initialization"]
     )
     erase_fit = _gdn_fit_erase(source, normalized["initialization"])
+    canonical_erase_fit = _gdn_fit_erase(
+        source, normalized["initialization"], canonical=True
+    )
     decay_fit = _gdn_fit_decay(source, normalized["initialization"], alpha_grid)
     gate_scale = _gdn_gate_scale(source, normalized["initialization"])
 
@@ -929,8 +1071,27 @@ def audit_gdn_layer(
     # D12: all closed-form canonical substitutions at once.  This is deliberately
     # a zero-training student: the only fitted quantities are the §3.2 closed
     # regressions used as initialization, and no validation tensor enters them.
-    canonical_ka = best_ka_heads
-    canonical_a_init = _gdn_apply_erase(source, normalized["initialization"], erase_fit)
+    canonical_source_a = (
+        closed_parts_initial["beta"] * closed_parts_initial["log_decay"].exp()
+    )
+    canonical_variances = []
+    for ka in ka_grid:
+        canonical_gamma = closed_parts_initial["beta"] / (
+            canonical_key_norm * (1 + (canonical_source_a - 1) * ka)
+        )
+        canonical_variances.append(canonical_gamma.log().var(dim=(0, 1), unbiased=False))
+    canonical_variance_grid = torch.stack(canonical_variances)
+    canonical_ka = torch.tensor(
+        [ka_grid[index] for index in canonical_variance_grid.argmin(0).tolist()],
+        device=init_hidden.device,
+        dtype=torch.float32,
+    )
+    canonical_a_init = _gdn_apply_erase(
+        source,
+        normalized["initialization"],
+        canonical_erase_fit,
+        canonical=True,
+    )
     canonical_gamma = _gdn_geometric(
         source_parts["initialization"]["beta"]
         / (canonical_key_norm * (1 + (canonical_a_init - 1) * canonical_ka.view(1, 1, -1)))
@@ -948,7 +1109,9 @@ def audit_gdn_layer(
             dim=-1,
         )
         parts = _gdn_components(source, hidden, frontend)
-        fitted_erase = _gdn_apply_erase(source, hidden, erase_fit)
+        fitted_erase = _gdn_apply_erase(
+            source, hidden, canonical_erase_fit, canonical=True
+        )
         fitted_log_decay, _ = _gdn_apply_decay(source, hidden, decay_fit)
         factor = 1 + (fitted_erase - 1) * canonical_ka.view(1, 1, -1)
         raw = _rwkv_trace_separate(
@@ -962,7 +1125,15 @@ def audit_gdn_layer(
         fitted_gate = (
             gate_scale.view(1, 1, source.num_v_heads, source.head_v_dim) * parts["z"].sigmoid()
         )
-        candidate = _gdn_boundary(source, raw, parts["z"], group=True, gate_value=fitted_gate)
+        candidate = _gdn_boundary(
+            source,
+            raw,
+            parts["z"],
+            group=True,
+            gate_value=fitted_gate,
+            group_weight=d10_affine_weight,
+            group_bias=d10_affine_bias,
+        )
         d12_metrics[split] = all_metrics(split, candidate)
     put(
         "D12_all_D1_D11_canonical_zero_training",
@@ -973,4 +1144,8 @@ def audit_gdn_layer(
     return result
 
 
-__all__ = ["audit_gdn_layer", "initialize_gdn_layer"]
+__all__ = [
+    "audit_gdn_layer",
+    "initialize_gdn_layer",
+    "initialize_gdn_scaffold",
+]

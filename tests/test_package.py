@@ -22,6 +22,7 @@ from any2rwkv.qwen2rwkv.qwen3_5.transformers.modeling_qwen2rwkv import (
     Qwen2RWKVDecoderLayer,
     Qwen2RWKVForCausalLM,
     Qwen2RWKVTimeMix,
+    ScaffoldTimeMix,
     _FP32RotaryEmbedding,
 )
 
@@ -44,6 +45,41 @@ def _config() -> Qwen2RWKVConfig:
         },
         attention_bias=False,
     )
+
+
+def _gqa_scaffold_fixture() -> tuple[ScaffoldTimeMix, torch.Tensor]:
+    config = _config()
+    source = Qwen2RWKVTimeMix(config, 0).float()
+    hidden = torch.randn(1, 5, 2048, generator=torch.Generator().manual_seed(7))
+    return ScaffoldTimeMix(config, 0, origin="full_attention", source=source), hidden
+
+
+def test_scaffold_lambda_zero_matches_source_layer_cpu() -> None:
+    scaffold, hidden = _gqa_scaffold_fixture()
+    actual, _ = scaffold(hidden)
+    expected = scaffold.source.reference_forward(hidden)
+    assert torch.equal(actual, expected)
+
+
+def test_scaffold_lambda_one_runs_canonical_form_cpu() -> None:
+    scaffold, hidden = _gqa_scaffold_fixture()
+    scaffold.set_lambdas(**{name: 1.0 for name in scaffold.lambda_values()})
+    actual, _ = scaffold(hidden)
+    assert actual.shape == hidden.shape
+    assert actual.dtype == torch.float32
+    assert torch.isfinite(actual).all()
+
+
+def test_scaffold_to_canonical_has_rwkv_contract() -> None:
+    scaffold, _ = _gqa_scaffold_fixture()
+    scaffold.set_lambdas(**{name: 1.0 for name in scaffold.lambda_values()})
+    exported = scaffold.to_canonical()
+    expected = scaffold.canonical_state_spec()
+    assert set(exported) == set(expected)
+    assert exported["r_k"].shape == (16, 128)
+    for name, shape in expected.items():
+        if name != "r_k":
+            assert tuple(exported[name].shape) == shape
 
 
 def test_gqa_reference_is_explicit_numerator_denominator_recurrence() -> None:

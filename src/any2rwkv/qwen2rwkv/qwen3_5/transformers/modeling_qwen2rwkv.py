@@ -23,6 +23,8 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from transformers.models.rwkv.configuration_rwkv import RwkvConfig
+from transformers.models.rwkv.modeling_rwkv import RwkvTimeMix
 
 GDN = "linear_attention"
 GQA = "full_attention"
@@ -41,6 +43,28 @@ GQA_DECAY_LOGITS = -30.0
 GQA_STATE_SCALE = 1.0 / 256.0
 CLAMP_W_EPSILON = 1e-4
 W_SCALE = -math.exp(-0.5)
+CANONICAL_HEAD_SIZE = 128
+CANONICAL_HEADS = 16
+CANONICAL_DECAY_LOW_RANK_DIM = 128
+CANONICAL_A_LOW_RANK_DIM = 32
+CANONICAL_V_LOW_RANK_DIM = 32
+CANONICAL_GATE_LOW_RANK_DIM = 2048
+
+
+def _canonical_reference_spec(hidden_size: int = 2048) -> dict[str, tuple[int, ...]]:
+    """Build the upstream parameter contract with the deliberate r_k reshape exception."""
+    reference_config = RwkvConfig(
+        hidden_size=hidden_size,
+        head_size=64,
+        num_hidden_layers=24,
+        vocab_size=248320,
+        decay_low_rank_dim=CANONICAL_DECAY_LOW_RANK_DIM,
+        a_low_rank_dim=CANONICAL_A_LOW_RANK_DIM,
+        v_low_rank_dim=CANONICAL_V_LOW_RANK_DIM,
+        gate_low_rank_dim=CANONICAL_GATE_LOW_RANK_DIM,
+    )
+    reference = RwkvTimeMix(reference_config, 0)
+    return {name: tuple(value.shape) for name, value in reference.state_dict().items()}
 
 
 class _FP32RotaryEmbedding(Qwen3_5TextRotaryEmbedding):
@@ -102,6 +126,12 @@ class Qwen2RWKVConfig(Qwen3_5TextConfig):
     gqa_states_per_query_head: int = GQA_STATES_PER_QUERY_HEAD
     gqa_readout_mode: str = GQA_READOUT_MODE
     gqa_checkpoint_schema: str = GQA_CHECKPOINT_SCHEMA
+    tmix_schema: str = "source_shell_v1"
+    scaffold_stage: list[int] | None = None
+    decay_low_rank_dim: int = CANONICAL_DECAY_LOW_RANK_DIM
+    a_low_rank_dim: int = CANONICAL_A_LOW_RANK_DIM
+    v_low_rank_dim: int = CANONICAL_V_LOW_RANK_DIM
+    gate_low_rank_dim: int = CANONICAL_GATE_LOW_RANK_DIM
 
     def __post_init__(self, **kwargs):
         if self.source_layer_types is None:
@@ -139,6 +169,8 @@ class Qwen2RWKVConfig(Qwen3_5TextConfig):
                 f"unsupported RWKV feature-state GQA geometry {geometry}; expected {expected}"
             )
         super().__post_init__(**kwargs)
+        if self.scaffold_stage is None:
+            self.scaffold_stage = [0] * self.num_hidden_layers
 
     @classmethod
     def from_dict(cls, config_dict, **kwargs):
@@ -500,6 +532,411 @@ class Qwen2RWKVGatedDeltaNet(Qwen3_5GatedDeltaNet):
                 raise TypeError("inference requires Qwen2RWKVCache")
             output, value = self._inference_forward(x, past_key_values, attention_mask)
         return output, value if v_first is None else v_first
+
+
+class ScaffoldTimeMix(nn.Module):
+    """S1/T1 homotopy wrapper around the canonical RWKV-7 TMix.
+
+    The source module is deliberately retained as a child module during the
+    scaffold stages.  At the two endpoints the wrapper uses one complete
+    reference path: this makes the lambda-zero identity and the lambda-one
+    export independently testable before any distillation is run.
+    """
+
+    def __init__(
+        self,
+        config: Qwen2RWKVConfig,
+        layer_idx: int,
+        *,
+        origin: str,
+        source: nn.Module,
+        teacher: nn.Module | None = None,
+    ):
+        super().__init__()
+        if origin not in (GDN, GQA):
+            raise ValueError(f"unknown scaffold origin {origin!r}")
+        if config.hidden_size != 2048:
+            raise ValueError("ScaffoldTimeMix currently supports hidden_size=2048 only")
+        self.config = config
+        self.layer_idx = layer_idx
+        self.origin = origin
+        self.heads = CANONICAL_HEADS
+        self.head_size = CANONICAL_HEAD_SIZE
+        self.channels = config.hidden_size
+        self.source = source
+        # The frozen teacher is a construction-time aid and is intentionally
+        # not part of the scaffold checkpoint state dict.
+        self.__dict__["_teacher"] = teacher
+        for name in ("x_r", "x_w", "x_k", "x_v", "x_a", "x_g"):
+            setattr(self, name, nn.Parameter(torch.zeros(1, 1, self.channels)))
+        self.w0 = nn.Parameter(torch.zeros(1, 1, self.channels))
+        self.w1 = nn.Parameter(torch.zeros(self.channels, CANONICAL_DECAY_LOW_RANK_DIM))
+        self.w2 = nn.Parameter(torch.zeros(CANONICAL_DECAY_LOW_RANK_DIM, self.channels))
+        self.a0 = nn.Parameter(torch.zeros(1, 1, self.channels))
+        self.a1 = nn.Parameter(torch.zeros(self.channels, CANONICAL_A_LOW_RANK_DIM))
+        self.a2 = nn.Parameter(torch.zeros(CANONICAL_A_LOW_RANK_DIM, self.channels))
+        self.v0 = nn.Parameter(torch.zeros(1, 1, self.channels))
+        self.v1 = nn.Parameter(torch.zeros(self.channels, CANONICAL_V_LOW_RANK_DIM))
+        self.v2 = nn.Parameter(torch.zeros(CANONICAL_V_LOW_RANK_DIM, self.channels))
+        self.g1 = nn.Parameter(torch.zeros(self.channels, CANONICAL_GATE_LOW_RANK_DIM))
+        self.g2 = nn.Parameter(torch.zeros(CANONICAL_GATE_LOW_RANK_DIM, self.channels))
+        self.k_k = nn.Parameter(torch.ones(1, 1, self.channels))
+        self.k_a = nn.Parameter(torch.zeros(1, 1, self.channels))
+        self.r_k = nn.Parameter(torch.zeros(self.heads, self.head_size))
+        self.receptance = nn.Linear(self.channels, self.channels, bias=False)
+        self.key = nn.Linear(self.channels, self.channels, bias=False)
+        self.value = nn.Linear(self.channels, self.channels, bias=False)
+        self.output = nn.Linear(self.channels, self.channels, bias=False)
+        self.ln_x = nn.GroupNorm(self.heads, self.channels, eps=64e-5)
+
+        if origin == GDN:
+            lambda_names = (
+                "lambda_front",
+                "lambda_rho",
+                "lambda_gamma",
+                "lambda_erase",
+                "lambda_decay",
+                "lambda_norm",
+                "lambda_gate",
+            )
+        else:
+            lambda_names = ("lambda_den", "lambda_rope", "lambda_qk", "lambda_phi")
+        for name in lambda_names:
+            self.register_buffer(name, torch.zeros(()), persistent=False)
+        self._assert_canonical_contract()
+
+    @staticmethod
+    def canonical_state_spec() -> dict[str, tuple[int, ...]]:
+        return _canonical_reference_spec()
+
+    def _assert_canonical_contract(self) -> None:
+        expected = self.canonical_state_spec()
+        actual = {
+            name: tuple(value.shape)
+            for name, value in self.state_dict().items()
+            if not name.startswith("source.")
+        }
+        # source.* is the only non-canonical state prefix; the nonpersistent
+        # lambda buffers do not enter state_dict().
+        missing = set(expected).difference(actual)
+        if missing:
+            raise RuntimeError(f"scaffold canonical parameters are missing {sorted(missing)}")
+        for name, shape in expected.items():
+            if name == "r_k":
+                if self.r_k.numel() != math.prod(shape):
+                    raise RuntimeError("canonical r_k has the wrong number of elements")
+            elif actual[name] != shape:
+                raise RuntimeError(
+                    f"canonical shape mismatch for {name}: {actual[name]} != {shape}"
+                )
+
+    def set_lambdas(self, **values: float) -> None:
+        for name, value in values.items():
+            if not name.startswith("lambda_") or not hasattr(self, name):
+                raise ValueError(f"unknown scaffold lambda {name!r}")
+            tensor = getattr(self, name)
+            tensor.fill_(float(value))
+
+    def lambda_values(self) -> dict[str, float]:
+        return {
+            name: float(value) for name, value in self.named_buffers() if name.startswith("lambda_")
+        }
+
+    def _all_lambdas(self, value: float) -> bool:
+        return all(abs(current - value) <= 1e-7 for current in self.lambda_values().values())
+
+    @staticmethod
+    def _shift(x: torch.Tensor, parameter: torch.Tensor) -> torch.Tensor:
+        previous = torch.cat((torch.zeros_like(x[:, :1]), x[:, :-1]), dim=1)
+        return x + parameter.to(x.dtype) * (previous - x)
+
+    def _source_gdn_reference(self, x: torch.Tensor):
+        source = self.source
+        if x.is_cuda and x.dtype == torch.bfloat16 and hasattr(source, "_training_forward"):
+            was_training = source.training
+            source.train()
+            try:
+                output, value = source._training_forward(
+                    x, torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
+                )
+            finally:
+                source.train(was_training)
+            return output.float(), value.float()
+        batch, length, _ = x.shape
+        mixed = causal_conv1d_fn(
+            source.in_proj_qkv(x).transpose(1, 2),
+            source.conv1d.weight.squeeze(1),
+            source.conv1d.bias,
+            activation=source.activation,
+        )[:, :, :length].transpose(1, 2)
+        query, key, value = torch.split(
+            mixed, (source.key_dim, source.key_dim, source.value_dim), dim=-1
+        )
+        query = query.view(batch, length, source.num_k_heads, source.head_k_dim)
+        key = key.view(batch, length, source.num_k_heads, source.head_k_dim)
+        value = value.view(batch, length, source.num_v_heads, source.head_v_dim)
+        query = query * torch.rsqrt(query.float().square().sum(-1, keepdim=True) + 1e-6)
+        key = key * torch.rsqrt(key.float().square().sum(-1, keepdim=True) + 1e-6)
+        if source.num_v_heads != source.num_k_heads:
+            repeats = source.num_v_heads // source.num_k_heads
+            query = query.repeat_interleave(repeats, dim=2)
+            key = key.repeat_interleave(repeats, dim=2)
+        beta = torch.sigmoid(source.in_proj_b(x)).float()
+        log_decay = -source.A_log.float().exp() * F.softplus(
+            source.in_proj_a(x).float() + source.dt_bias.float()
+        )
+        ratio = (log_decay / W_SCALE).clamp(CLAMP_W_EPSILON, 1 - CLAMP_W_EPSILON)
+        log_decay = W_SCALE * ratio
+        state = torch.zeros(
+            batch,
+            source.num_v_heads,
+            source.head_v_dim,
+            source.head_v_dim,
+            dtype=torch.float32,
+            device=x.device,
+        )
+        outputs = []
+        for token in range(length):
+            direction = key[:, token].float()
+            memory = torch.einsum("bhk,bhkv->bhv", direction, state)
+            state = (
+                state * log_decay[:, token].float().exp()[..., None, None]
+                - (beta[:, token] * log_decay[:, token].float().exp())[..., None, None]
+                * torch.einsum("bhk,bhv->bhkv", direction, memory)
+                + torch.einsum(
+                    "bhk,bhv->bhkv", direction, beta[:, token, :, None] * value[:, token].float()
+                )
+            )
+            outputs.append(torch.einsum("bhk,bhkv->bhv", query[:, token].float(), state))
+        raw = torch.stack(outputs, dim=1).to(x.dtype)
+        gate = source.in_proj_z(x).view(batch, length, source.num_v_heads, source.head_v_dim)
+        boundary = source.norm(
+            raw.reshape(-1, source.head_v_dim), gate.reshape(-1, source.head_v_dim)
+        ).view(batch, length, source.value_dim)
+        return source.out_proj(boundary).float(), value.reshape(batch, length, -1).float()
+
+    def _source_forward(
+        self, x: torch.Tensor, v_first=None, position_ids=None, past_key_values=None
+    ):
+        if (
+            past_key_values is not None
+            and not isinstance(past_key_values, dict)
+            and hasattr(self.source, "forward")
+        ):
+            attention_mask = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
+            return self.source(
+                x,
+                v_first=v_first,
+                past_key_values=past_key_values,
+                attention_mask=attention_mask,
+            )
+        if self.origin == GDN:
+            return self._source_gdn_reference(x)
+        source = self.source
+        if (
+            x.is_cuda
+            and x.dtype == torch.bfloat16
+            and hasattr(source, "_training_forward")
+        ):
+            was_training = source.training
+            source.train()
+            try:
+                return source._training_forward(x, v_first)
+            finally:
+                source.train(was_training)
+        if hasattr(source, "reference_forward"):
+            if position_ids is None:
+                position_ids = torch.arange(x.shape[1], device=x.device).expand(x.shape[0], -1)
+            return source.reference_forward(x, position_ids, v_first), None
+        raise RuntimeError("GQA scaffold source must provide reference_forward")
+
+    def _canonical_inputs(self, x: torch.Tensor, v_first=None, previous=None):
+        if previous is None:
+            shifts = {
+                name: self._shift(x, getattr(self, f"x_{name}"))
+                for name in ("r", "w", "k", "v", "a", "g")
+            }
+        else:
+            shifts = {
+                name: x + getattr(self, f"x_{name}").to(x.dtype) * (previous - x)
+                for name in ("r", "w", "k", "v", "a", "g")
+            }
+        read = F.linear(shifts["r"], self.receptance.weight)
+        key = F.linear(shifts["k"], self.key.weight)
+        value = F.linear(shifts["v"], self.value.weight)
+        if self.layer_idx == 0:
+            first = value
+        else:
+            first = value if v_first is None else v_first
+            residual = torch.sigmoid(self.v0 + torch.tanh(shifts["v"] @ self.v1) @ self.v2)
+            value = value + residual * (first - value)
+        decay_state = self.w0 + torch.tanh(shifts["w"] @ self.w1) @ self.w2
+        log_decay = W_SCALE * torch.sigmoid(decay_state)
+        learning_rate = torch.sigmoid(self.a0 + torch.tanh(shifts["a"] @ self.a1) @ self.a2)
+        direction = F.normalize(
+            key.view(*key.shape[:2], self.heads, self.head_size).float()
+            * self.k_k.view(1, 1, self.heads, self.head_size).float(),
+            dim=-1,
+        )
+        write_key = key.view(*key.shape[:2], self.heads, self.head_size) * (
+            1
+            + (learning_rate.view(*learning_rate.shape[:2], self.heads, self.head_size) - 1)
+            * self.k_a.view(1, 1, self.heads, self.head_size)
+        )
+        return (
+            read.view(*read.shape[:2], self.heads, self.head_size),
+            direction,
+            learning_rate.view(*learning_rate.shape[:2], self.heads, self.head_size),
+            write_key,
+            value.view(*value.shape[:2], self.heads, self.head_size),
+            log_decay.view(*log_decay.shape[:2], self.heads, self.head_size),
+            shifts["g"],
+            first,
+        )
+
+    def _canonical_scan(self, inputs):
+        read, direction, learning_rate, write_key, value, log_decay, _gate, first = inputs
+        batch, length, heads, width = read.shape
+        if read.is_cuda and read.dtype == torch.bfloat16:
+            try:
+                flash = _flash("training", read)
+                decay_logits = torch.logit(
+                    (log_decay.float() / W_SCALE).clamp(CLAMP_W_EPSILON, 1 - CLAMP_W_EPSILON)
+                ).to(read.dtype)
+                raw = flash.pretrain_recurrent_bf16(
+                    read.reshape(batch, length, -1).contiguous(),
+                    decay_logits.reshape(batch, length, -1).contiguous(),
+                    write_key.reshape(batch, length, -1).contiguous(),
+                    value.reshape(batch, length, -1).contiguous(),
+                    (-direction).to(read.dtype).reshape(batch, length, -1).contiguous(),
+                    (direction * learning_rate)
+                    .to(read.dtype)
+                    .reshape(batch, length, -1)
+                    .contiguous(),
+                    head_size=self.head_size,
+                )
+                return raw.view(batch, length, heads, width).float(), first
+            except (RuntimeError, AttributeError):
+                pass
+        state = torch.zeros(batch, heads, width, width, dtype=torch.float32, device=read.device)
+        raw = []
+        for token in range(length):
+            direction_t = direction[:, token].float()
+            memory = torch.einsum("bhk,bhkv->bhv", direction_t, state)
+            state = (
+                state * log_decay[:, token].float().exp().unsqueeze(-1)
+                - torch.einsum(
+                    "bhk,bhv->bhkv",
+                    direction_t * learning_rate[:, token].float(),
+                    memory,
+                )
+                + torch.einsum(
+                    "bhk,bhv->bhkv", write_key[:, token].float(), value[:, token].float()
+                )
+            )
+            raw.append(torch.einsum("bhk,bhkv->bhv", read[:, token].float(), state))
+        return torch.stack(raw, dim=1), first
+
+    def _canonical_readout(self, x: torch.Tensor, raw: torch.Tensor, inputs):
+        read, _direction, _learning_rate, write_key, value, _log_decay, gate_input, _ = inputs
+        flat = raw.reshape(x.shape[0] * x.shape[1], self.channels)
+        normalized = self.ln_x(flat.to(self.ln_x.weight.dtype)).float().view_as(raw)
+        shortcut = (
+            read.float()
+            * write_key.float()
+            * self.r_k.view(1, 1, self.heads, self.head_size).float()
+        ).sum(-1, keepdim=True) * value.float()
+        heads = normalized + shortcut
+        gate = torch.sigmoid(gate_input.float() @ self.g1.float()) @ self.g2.float()
+        mixed = heads.reshape(x.shape[0], x.shape[1], self.channels) * gate
+        return F.linear(mixed, self.output.weight.float()).to(x.dtype)
+
+    def _canonical_step(self, x: torch.Tensor, v_first, cache: dict):
+        inputs = self._canonical_inputs(x, v_first, cache.get("previous"))
+        read, direction, learning_rate, write_key, value, log_decay, _gate, first = inputs
+        state = cache.get(
+            "state",
+            torch.zeros(
+                x.shape[0], self.heads, self.head_size, self.head_size,
+                dtype=torch.float32, device=x.device
+            ),
+        )
+        direction_t = direction[:, 0].float()
+        memory = torch.einsum("bhk,bhkv->bhv", direction_t, state)
+        state = (
+            state * log_decay[:, 0].float().exp().unsqueeze(-1)
+            - torch.einsum(
+                "bhk,bhv->bhkv", direction_t * learning_rate[:, 0].float(), memory
+            )
+            + torch.einsum(
+                "bhk,bhv->bhkv", write_key[:, 0].float(), value[:, 0].float()
+            )
+        )
+        raw = torch.einsum("bhk,bhkv->bhv", read[:, 0].float(), state).unsqueeze(1)
+        cache["state"] = state
+        cache["previous"] = x[:, -1:].detach()
+        cache["first"] = first.detach()
+        return self._canonical_readout(x, raw, inputs), first
+
+    def _canonical_forward(self, x: torch.Tensor, v_first=None, past_key_values=None):
+        if isinstance(past_key_values, dict) and x.shape[1] == 1:
+            return self._canonical_step(x, v_first, past_key_values)
+        inputs = self._canonical_inputs(x, v_first)
+        raw, first = self._canonical_scan(inputs)
+        return self._canonical_readout(x, raw, inputs), first
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        v_first: torch.Tensor | None = None,
+        past_key_values=None,
+        attention_mask: torch.Tensor | None = None,
+        use_cache: bool = False,
+        position_ids: torch.Tensor | None = None,
+    ):
+        if attention_mask is not None and not torch.all(attention_mask == 1):
+            raise ValueError("ScaffoldTimeMix requires an all-ones attention mask")
+        if self._all_lambdas(0.0):
+            return self._source_forward(
+                hidden_states, v_first, position_ids, past_key_values
+            )
+        canonical, first = self._canonical_forward(
+            hidden_states, v_first, past_key_values
+        )
+        if self._all_lambdas(1.0):
+            return canonical, first
+        source, source_first = self._source_forward(
+            hidden_states, v_first, position_ids, past_key_values
+        )
+        values = list(self.lambda_values().values())
+        blend = sum(values) / len(values)
+        output = source.float() * (1 - blend) + canonical.float() * blend
+        if first is None:
+            first = source_first
+        return output.to(hidden_states.dtype), first
+
+    def load_canonical_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        expected = set(self.canonical_state_spec())
+        if set(state) != expected:
+            raise ValueError(f"canonical initialization keys differ: {set(state) ^ expected}")
+        with torch.no_grad():
+            for name, value in state.items():
+                target = self.r_k if name == "r_k" else self.get_parameter(name)
+                target.copy_(value.to(device=target.device, dtype=target.dtype).reshape_as(target))
+
+    def to_canonical(self) -> dict[str, torch.Tensor]:
+        if not self._all_lambdas(1.0):
+            raise RuntimeError(f"cannot export scaffold with lambdas {self.lambda_values()}")
+        expected = self.canonical_state_spec()
+        state = {}
+        for name in expected:
+            value = self.r_k if name == "r_k" else self.get_parameter(name)
+            state[name] = value.detach().clone()
+            if name != "r_k" and tuple(state[name].shape) != expected[name]:
+                raise RuntimeError(f"canonical export shape mismatch for {name}")
+        if set(state) != set(expected) or state["r_k"].numel() != math.prod(expected["r_k"]):
+            raise RuntimeError("canonical export key/shape contract failed")
+        return state
 
 
 def _repeat_gqa(tensor: torch.Tensor, groups: int) -> torch.Tensor:

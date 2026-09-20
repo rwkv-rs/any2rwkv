@@ -31,7 +31,7 @@ from ..gqa2rwkv import (
 from .datasets import PackedSequences, build_packed_sequences
 from .last_layer_cache import LastLayerCache
 from .model_qwen import load_qwen_teacher
-from .model_qwen2rwkv import build_qwen2rwkv
+from .model_qwen2rwkv import build_qwen2rwkv, initialize_scaffold_layers
 
 PROMPTS = (
     "请用三句话解释为什么天空是蓝色的。",
@@ -206,6 +206,231 @@ def audit_qwen3_5_2b(
         flush=True,
     )
     return audit_path
+
+
+def _stage1_nmse(actual: torch.Tensor, wanted: torch.Tensor) -> float:
+    actual = actual.float()
+    wanted = wanted.float()
+    return float((actual - wanted).square().mean() / (wanted.square().mean() + 1e-12))
+
+
+def _stage1_layer_output(source_layer, hidden: torch.Tensor, tmix: torch.Tensor) -> torch.Tensor:
+    residual = hidden.float() + tmix.float()
+    return (
+        residual + source_layer.mlp(source_layer.post_attention_layernorm(residual)).float()
+    ).float()
+
+
+def _stage1_measure(
+    scaffold,
+    hidden: torch.Tensor,
+    positions: torch.Tensor,
+    reference_tmix: torch.Tensor,
+    source_layer,
+    *,
+    lambdas: dict[str, float],
+    dtype: torch.dtype,
+    decode: bool = False,
+    residual_hidden: torch.Tensor | None = None,
+) -> dict[str, float | str]:
+    """Measure one endpoint without changing the stored FP32 scaffold."""
+    module = scaffold if dtype == torch.float32 else copy.deepcopy(scaffold).to(dtype)
+    module.eval()
+    module.set_lambdas(**lambdas)
+    values = hidden.to(dtype)
+    positions = positions.to(values.device)
+    if decode:
+        from ..transformers.modeling_qwen2rwkv import Qwen2RWKVCache
+
+        cache = (
+            Qwen2RWKVCache(module.config)
+            if module._all_lambdas(0.0)
+            else {}
+        )
+        pieces = []
+        first = None
+        for token in range(values.shape[1]):
+            output, first = module(
+                values[:, token : token + 1],
+                v_first=first,
+                past_key_values=cache,
+                position_ids=positions[:, token : token + 1],
+            )
+            pieces.append(output)
+        output = torch.cat(pieces, dim=1)
+        cache_mode = "recurrent_cache_reuse"
+    else:
+        output = module(values, position_ids=positions)[0]
+        cache_mode = "full_sequence_reference"
+    residual_hidden = hidden if residual_hidden is None else residual_hidden
+    layer = _stage1_layer_output(source_layer, residual_hidden, output)
+    reference_layer = _stage1_layer_output(source_layer, residual_hidden, reference_tmix)
+    if dtype != torch.float32:
+        del module
+    return {
+        "tmix_output_nmse": _stage1_nmse(output, reference_tmix),
+        "layer_output_nmse": _stage1_nmse(layer, reference_layer),
+        "dtype": str(dtype).replace("torch.", ""),
+        "cache_mode": cache_mode,
+    }
+
+
+@torch.no_grad()
+def stage1_qwen3_5_2b(source: str, output: str):
+    """Run zero-training S1/T1 construction and its four endpoint audits."""
+    output_path = Path(output).resolve()
+    output_path.mkdir(parents=True, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    packed_path = output_path / "packed_sequences.pt"
+    if not packed_path.is_file():
+        raise FileNotFoundError(
+            "stage1-only reuses Stage -1 packed_sequences.pt; run Stage -1 first"
+        )
+    input_ids = torch.load(packed_path, map_location="cpu", weights_only=True)
+    if isinstance(input_ids, dict):
+        input_ids = input_ids["input_ids"]
+    input_ids = input_ids[:24].contiguous()
+    source_outer, source_text = load_qwen_teacher(source, torch.float32, device)
+    source_text.eval()
+    activations = _audit_source_activations(source_text, input_ids, device)
+    target = build_qwen2rwkv(source_outer, source_text)
+    target.eval()
+    initialize_scaffold_layers(target, source_text, activations)
+    from ..gdn2rwkv import _gdn_trace
+    from ..gqa2rwkv import _source_tmix_output
+
+    records = []
+    for layer_idx, source_layer in enumerate(source_text.layers):
+        scaffold = target.model.layers[layer_idx].tmix
+        hidden = activations[layer_idx].to(device).float()
+        normalized = source_layer.input_layernorm(hidden).float()
+        positions = torch.arange(hidden.shape[1], device=device).expand(hidden.shape[0], -1)
+        if source_text.config.layer_types[layer_idx] == "linear_attention":
+            origin = "linear_attention"
+            current_tmix = scaffold._source_gdn_reference(normalized)[0]
+            teacher_tmix = _gdn_trace(source_layer.linear_attn, normalized)["source_output"]
+            zero_lambdas = {name: 0.0 for name in scaffold.lambda_values()}
+            one_lambdas = {name: 1.0 for name in scaffold.lambda_values()}
+        else:
+            origin = "full_attention"
+            embeddings = _position(source_text, normalized)[1]
+            current_tmix = scaffold.source.reference_forward(normalized, positions)
+            teacher_tmix = _source_tmix_output(source_layer.self_attn, normalized, embeddings)
+            zero_lambdas = {name: 0.0 for name in scaffold.lambda_values()}
+            one_lambdas = {name: 1.0 for name in scaffold.lambda_values()}
+        init = slice(0, 8)
+        validation = slice(8, 24)
+        path_specs = (
+            ("fp32_reference", torch.float32, False),
+            ("bf16_training_kernel", torch.bfloat16, False),
+            ("fp16_prefill", torch.float16, False),
+            ("fp16_decode_cache", torch.float16, True),
+        )
+        endpoints = {"A_lambda_zero": {}, "B_lambda_one": {}}
+        for endpoint, lambdas, reference in (
+            ("A_lambda_zero", zero_lambdas, current_tmix),
+            ("B_lambda_one", one_lambdas, teacher_tmix),
+        ):
+            for path_name, dtype, decode in path_specs:
+                path = {}
+                for split_name, split in (("initialization", init), ("validation", validation)):
+                    try:
+                        path[split_name] = _stage1_measure(
+                            scaffold,
+                            normalized[split],
+                            positions[split],
+                            reference[split],
+                            source_layer,
+                            lambdas=lambdas,
+                            dtype=dtype,
+                            decode=decode,
+                            residual_hidden=hidden[split],
+                        )
+                    except (RuntimeError, ValueError) as error:
+                        path[split_name] = {
+                            "error": str(error),
+                            "dtype": str(dtype).replace("torch.", ""),
+                        }
+                endpoints[endpoint][path_name] = path
+        canonical = scaffold.to_canonical()
+        expected = scaffold.canonical_state_spec()
+        canonical_names = set(expected)
+        canonical_parameters = [
+            parameter for name, parameter in scaffold.named_parameters() if name in canonical_names
+        ]
+        scaffold_parameters = [
+            parameter
+            for name, parameter in scaffold.named_parameters()
+            if name not in canonical_names
+        ]
+        records.append(
+            {
+                "layer": layer_idx,
+                "origin": origin,
+                "lambdas": scaffold.lambda_values(),
+                "A": endpoints["A_lambda_zero"],
+                "B": endpoints["B_lambda_one"],
+                "C_to_canonical": {
+                    "keys_equal": set(canonical) == set(expected),
+                    "key_count": len(canonical),
+                    "r_k_shape": list(canonical["r_k"].shape),
+                    "r_k_numel_equal": canonical["r_k"].numel() == math.prod(expected["r_k"]),
+                    "shape_mismatches": {
+                        name: [list(canonical[name].shape), list(shape)]
+                        for name, shape in expected.items()
+                        if name != "r_k" and tuple(canonical[name].shape) != shape
+                    },
+                },
+                "D_parameters": {
+                    "canonical_tensor_count": len(canonical_parameters),
+                    "canonical_parameter_count": sum(p.numel() for p in canonical_parameters),
+                    "scaffold_tensor_count": len(scaffold_parameters),
+                    "scaffold_parameter_count": sum(p.numel() for p in scaffold_parameters),
+                    "total_parameter_count": sum(p.numel() for p in scaffold.parameters()),
+                },
+            }
+        )
+        print(f"[stage1] layer {layer_idx} {origin}", flush=True)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    token_digest = hashlib.sha256(input_ids.numpy().tobytes()).hexdigest()
+    result = {
+        "schema": "canonical_stage1_s1_t1_v1",
+        "source": str(Path(source).resolve()),
+        "device": str(device),
+        "dtype": "float32_reference_bf16_fp16_endpoints",
+        "geometry": {
+            "layers": 24,
+            "gdn_layers": 18,
+            "gqa_layers": 6,
+            "hidden_size": 2048,
+            "canonical_head_size": 128,
+            "canonical_heads": 16,
+            "decay_low_rank_dim": 128,
+            "a_low_rank_dim": 32,
+            "v_low_rank_dim": 32,
+            "gate_low_rank_dim": 2048,
+        },
+        "activation": {
+            "rows": 24,
+            "initialization_rows": [0, 8],
+            "validation_rows": [8, 24],
+            "tokens_per_row": int(input_ids.shape[1]),
+            "token_sha256": token_digest,
+            "packed_sequences": str(packed_path),
+        },
+        "notes": {
+            "zero_training": True,
+            "v3_checkpoint": False,
+            "gqa_neutral_initialization": "w0=-12, a0=-12, v0=-8; no v3 regression",
+            "decode_cache": "native recurrent cache reuse; compared with full-sequence reference",
+        },
+        "layers": records,
+    }
+    stage1_path = output_path / "stage1.json"
+    stage1_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({"stage1": str(stage1_path), "layers": len(records)}), flush=True)
+    return stage1_path
 
 
 def _student_tmix_output(student, layer_idx, hidden, v_first=None):
@@ -1796,6 +2021,11 @@ def main():
         action="store_true",
         help="run Stage -1 FP32 component audit and write only output/audit.json",
     )
+    parser.add_argument(
+        "--stage1-only",
+        action="store_true",
+        help="run zero-training S1/T1 scaffold construction and write output/stage1.json",
+    )
     parser.add_argument("--global-kl-only", action="store_true")
     parser.add_argument("--through-layer", type=int, default=23)
     parser.add_argument("--gqa-prefix-cache")
@@ -1824,6 +2054,9 @@ def main():
         parser.error("--source is required for conversion")
     if args.audit_only:
         audit_qwen3_5_2b(args.source, args.output, args.agentic, args.math_dataset)
+        return
+    if args.stage1_only:
+        stage1_qwen3_5_2b(args.source, args.output)
         return
     if "WORLD_SIZE" not in os.environ:
         command = [

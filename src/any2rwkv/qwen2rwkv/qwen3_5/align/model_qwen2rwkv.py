@@ -6,13 +6,18 @@ from copy import deepcopy
 
 import torch
 
+from ..gdn2rwkv import initialize_gdn_scaffold
+from ..gqa2rwkv import initialize_gqa_layer, initialize_gqa_scaffold
 from ..transformers.modeling_qwen2rwkv import (
+    GDN,
     GDN_CHECKPOINT_SCHEMA,
     GDN_MODE,
+    GQA,
     GQA_CHECKPOINT_SCHEMA,
     GQA_READOUT_MODE,
     Qwen2RWKVConfig,
     Qwen2RWKVForCausalLM,
+    ScaffoldTimeMix,
 )
 
 
@@ -50,6 +55,8 @@ def _config(source_config) -> Qwen2RWKVConfig:
     values["gdn_checkpoint_schema"] = GDN_CHECKPOINT_SCHEMA
     values["gqa_readout_mode"] = GQA_READOUT_MODE
     values["gqa_checkpoint_schema"] = GQA_CHECKPOINT_SCHEMA
+    values["tmix_schema"] = "source_shell_v1"
+    values["scaffold_stage"] = [0] * source_config.num_hidden_layers
     return Qwen2RWKVConfig(**values)
 
 
@@ -112,4 +119,57 @@ def build_qwen2rwkv(source_outer, source_text) -> Qwen2RWKVForCausalLM:
     return target
 
 
-__all__ = ["build_qwen2rwkv"]
+@torch.no_grad()
+def initialize_scaffold_layers(target, source_text, activations):
+    """Wrap the copied S0/T0 layers with the zero-training S1/T1 scaffolds."""
+    if len(activations) != len(source_text.layers):
+        raise ValueError("one source activation tensor is required per layer")
+    for layer_idx, source_layer in enumerate(source_text.layers):
+        target_layer = target.model.layers[layer_idx]
+        hidden = activations[layer_idx].to(next(target_layer.parameters()).device).float()
+        normalized = source_layer.input_layernorm(hidden).float()
+        if source_layer.block_type == GDN:
+            scaffold = ScaffoldTimeMix(
+                target.config,
+                layer_idx,
+                origin=GDN,
+                source=target_layer.tmix,
+                teacher=source_layer.linear_attn,
+            )
+            initialize_gdn_scaffold(source_layer.linear_attn, scaffold, normalized[:8])
+            scaffold.to(
+                device=next(target_layer.tmix.parameters()).device,
+                dtype=next(target_layer.tmix.parameters()).dtype,
+            )
+            target_layer.tmix = scaffold
+            target.config.scaffold_stage[layer_idx] = 1
+        else:
+            positions = torch.arange(normalized.shape[1], device=normalized.device).expand(
+                normalized.shape[0], -1
+            )
+            embeddings = source_text.rotary_emb(normalized, positions)
+            init_embeddings = tuple(value[:8] for value in embeddings)
+            initialize_gqa_layer(
+                source_layer.self_attn, target_layer.tmix, normalized[:8], init_embeddings
+            )
+            scaffold = ScaffoldTimeMix(
+                target.config,
+                layer_idx,
+                origin=GQA,
+                source=target_layer.tmix,
+                teacher=source_layer.self_attn,
+            )
+            initialize_gqa_scaffold(
+                source_layer.self_attn, scaffold, normalized[:8], init_embeddings
+            )
+            scaffold.to(
+                device=next(target_layer.tmix.parameters()).device,
+                dtype=next(target_layer.tmix.parameters()).dtype,
+            )
+            target_layer.tmix = scaffold
+            target.config.scaffold_stage[layer_idx] = 1
+    target.config.tmix_schema = "scaffold_h128_s1_t1"
+    return target
+
+
+__all__ = ["build_qwen2rwkv", "initialize_scaffold_layers"]
