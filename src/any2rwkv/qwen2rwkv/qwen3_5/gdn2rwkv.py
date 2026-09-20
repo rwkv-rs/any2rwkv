@@ -248,18 +248,32 @@ def _rwkv_trace_separate(
     return torch.stack(outputs, 1)
 
 
-def _gdn_boundary(source, raw: torch.Tensor, gate: torch.Tensor, *, group=False, gate_value=None):
+def _gdn_boundary(
+    source,
+    raw: torch.Tensor,
+    gate: torch.Tensor,
+    *,
+    group=False,
+    gate_value=None,
+    group_weight=None,
+    group_bias=None,
+):
     batch, length = raw.shape[:2]
     heads = source.num_v_heads
     dim = source.head_v_dim
     flat = raw.reshape(-1, heads * dim).float()
     if group:
-        weight = source.norm.weight.float().repeat(heads)
+        weight = (
+            source.norm.weight.float().repeat(heads)
+            if group_weight is None
+            else group_weight.float()
+        )
+        bias = torch.zeros_like(weight) if group_bias is None else group_bias.float()
         normalized = F.group_norm(
             flat,
             heads,
             weight=weight,
-            bias=torch.zeros_like(weight),
+            bias=bias,
             eps=64e-5,
         )
         normalized = normalized.view(batch, length, heads, dim)
@@ -349,6 +363,21 @@ def _gdn_apply_front_params(hidden, params, segments):
 
 def _gdn_geometric(value: torch.Tensor, dim=(0, 1)) -> torch.Tensor:
     return torch.exp(value.float().clamp_min(1e-30).log().mean(dim=dim))
+
+
+def _gdn_fit_channel_affine(actual: torch.Tensor, target: torch.Tensor):
+    actual = actual.float().reshape(-1, actual.shape[-1])
+    target = target.float().reshape(-1, target.shape[-1])
+    actual_mean = actual.mean(0)
+    target_mean = target.mean(0)
+    centered_actual = actual - actual_mean
+    centered_target = target - target_mean
+    weight = (centered_actual * centered_target).sum(0) / centered_actual.square().sum(0).clamp_min(
+        1e-12
+    )
+    bias = target_mean - weight * actual_mean
+    fitted = actual * weight + bias
+    return weight, bias, _nmse(fitted, target)
 
 
 def _gdn_layer_output(source_layer, hidden: torch.Tensor, tmix: torch.Tensor) -> torch.Tensor:
@@ -823,7 +852,30 @@ def audit_gdn_layer(
         alpha_grid=list(alpha_grid),
     )
 
+    def group_norm_base(raw):
+        flat = raw.reshape(-1, source.value_dim).float()
+        weight = torch.ones(source.value_dim, device=raw.device, dtype=torch.float32)
+        normalized = F.group_norm(
+            flat,
+            source.num_v_heads,
+            weight=weight,
+            bias=torch.zeros_like(weight),
+            eps=64e-5,
+        )
+        return normalized.view(raw.shape[0], raw.shape[1], source.num_v_heads, source.head_v_dim)
+
+    init_raw = source_traces["initialization"]["oracle_raw"]
+    init_rms_target = (
+        init_raw
+        * torch.rsqrt(init_raw.square().mean(-1, keepdim=True) + source.norm.variance_epsilon)
+        * source.norm.weight.float().view(1, 1, 1, source.head_v_dim)
+    )
+    d10_affine_weight, d10_affine_bias, d10_affine_fit_nmse = _gdn_fit_channel_affine(
+        group_norm_base(init_raw).reshape(init_raw.shape[0], init_raw.shape[1], -1),
+        init_rms_target.reshape(init_raw.shape[0], init_raw.shape[1], -1),
+    )
     norm_metrics = {}
+    norm_ls_metrics = {}
     gate_metrics = {}
     for split in split_inputs:
         parts = source_parts[split]
@@ -833,6 +885,19 @@ def audit_gdn_layer(
             split_inputs[split],
             source_traces[split]["source_output"],
             _gdn_boundary(source, source_raw, parts["z"], group=True),
+        )
+        norm_ls_metrics[split] = _gdn_metric(
+            source_layer,
+            split_inputs[split],
+            source_traces[split]["source_output"],
+            _gdn_boundary(
+                source,
+                source_raw,
+                parts["z"],
+                group=True,
+                group_weight=d10_affine_weight,
+                group_bias=d10_affine_bias,
+            ),
         )
         fitted_gate = (
             gate_scale.view(1, 1, source.num_v_heads, source.head_v_dim) * parts["z"].sigmoid()
@@ -844,6 +909,11 @@ def audit_gdn_layer(
             _gdn_boundary(source, source_raw, parts["z"], gate_value=fitted_gate),
         )
     put("D10_rmsnorm_to_groupnorm", norm_metrics)
+    put(
+        "D10_rmsnorm_to_groupnorm_ls_affine",
+        norm_ls_metrics,
+        affine_fit_nmse=d10_affine_fit_nmse,
+    )
     put(
         "D11_silu_gate_to_scale_sigmoid",
         gate_metrics,

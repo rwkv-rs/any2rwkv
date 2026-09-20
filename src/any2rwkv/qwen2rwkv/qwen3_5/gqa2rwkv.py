@@ -227,6 +227,8 @@ def _gqa_source_components(
     groups = source.config.num_attention_heads // source.config.num_key_value_heads
     query_norm = source.q_norm(query_raw.transpose(1, 2)).transpose(1, 2).float()
     key_norm = source.k_norm(key_raw.transpose(1, 2)).transpose(1, 2).float()
+    query_norm_gain = torch.rsqrt(query_raw.square().mean(-1) + source.q_norm.eps)
+    key_norm_gain = torch.rsqrt(key_raw.square().mean(-1) + source.k_norm.eps)
     query_scaled = query_raw * (1.0 + source.q_norm.weight.float()).view(1, 1, 1, -1)
     key_scaled = key_raw * (1.0 + source.k_norm.weight.float()).view(1, 1, 1, -1)
     cos, sin = position_embeddings
@@ -235,6 +237,10 @@ def _gqa_source_components(
     return {
         "q_norm_rope": query_norm_rope.float(),
         "k_norm_rope": key_norm_rope.repeat_interleave(groups, dim=1).float(),
+        "q_norm_gain": query_norm_gain.float(),
+        "k_norm_gain": key_norm_gain.repeat_interleave(groups, dim=1).float(),
+        "q_norm_scale": query_norm_gain.reciprocal().float(),
+        "k_norm_scale": key_norm_gain.reciprocal().repeat_interleave(groups, dim=1).float(),
         "q_norm": query_norm.float(),
         "k_norm": key_norm.repeat_interleave(groups, dim=1).float(),
         "q_scaled_rope": query_scaled_rope.float(),
@@ -310,15 +316,24 @@ def _gqa_safe_divide(numerator: torch.Tensor, denominator: torch.Tensor) -> torc
     return numerator / divisor.unsqueeze(-1)
 
 
-def _gqa_group_norm(numerator: torch.Tensor, heads: int, head_size: int) -> torch.Tensor:
+def _gqa_group_norm(
+    numerator: torch.Tensor,
+    heads: int,
+    head_size: int,
+    weight: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
     batch, _, length, width = numerator.shape
     flat = numerator.transpose(1, 2).reshape(batch * length, heads * width).float()
-    weight = torch.ones(heads * width, device=numerator.device, dtype=torch.float32)
+    if weight is None:
+        weight = torch.ones(heads * width, device=numerator.device, dtype=torch.float32)
+    if bias is None:
+        bias = torch.zeros_like(weight)
     normalized = F.group_norm(
         flat,
         heads * 2,
-        weight=weight,
-        bias=torch.zeros_like(weight),
+        weight=weight.float(),
+        bias=bias.float(),
         eps=64e-5,
     )
     return normalized.view(batch, length, heads, width).transpose(1, 2)
@@ -331,11 +346,19 @@ def _gqa_output(
     gate: torch.Tensor,
     *,
     use_denominator: bool,
+    group_weight: torch.Tensor | None = None,
+    group_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if use_denominator:
         heads = _gqa_safe_divide(numerator, denominator)
     else:
-        heads = _gqa_group_norm(numerator, source.config.num_attention_heads, source.head_dim)
+        heads = _gqa_group_norm(
+            numerator,
+            source.config.num_attention_heads,
+            source.head_dim,
+            group_weight,
+            group_bias,
+        )
     mixed = heads.transpose(1, 2).reshape_as(gate) * gate.sigmoid()
     return source.o_proj(mixed).float()
 
@@ -355,6 +378,48 @@ def _gqa_metric(source_layer, hidden, source_tmix, candidate_tmix):
             _gqa_layer_output(source_layer, hidden, source_tmix),
         ),
     }
+
+
+def _gqa_fit_channel_affine(actual: torch.Tensor, target: torch.Tensor):
+    actual = actual.transpose(1, 2).reshape(-1, actual.shape[1] * actual.shape[-1]).float()
+    target = target.transpose(1, 2).reshape(-1, target.shape[1] * target.shape[-1]).float()
+    actual_mean = actual.mean(0)
+    target_mean = target.mean(0)
+    centered_actual = actual - actual_mean
+    centered_target = target - target_mean
+    weight = (centered_actual * centered_target).sum(0) / centered_actual.square().sum(0).clamp_min(
+        1e-12
+    )
+    bias = target_mean - weight * actual_mean
+    fitted = actual * weight + bias
+    return weight, bias, _nmse(fitted, target)
+
+
+def _gqa_geometric(value: torch.Tensor, dim=(0, 2)) -> torch.Tensor:
+    return torch.exp(value.float().clamp_min(1e-30).log().mean(dim=dim))
+
+
+def _gqa_teacher_attention(
+    source,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    *,
+    decay: float | None = None,
+):
+    length = query.shape[2]
+    scores = torch.einsum("bhtd,bhsd->bhts", query.float(), key.float()) * source.scaling
+    causal = torch.ones(length, length, dtype=torch.bool, device=query.device).tril()
+    scores = scores.masked_fill(~causal.view(1, 1, length, length), -torch.inf)
+    probability = scores.softmax(-1)
+    if decay is not None:
+        positions = torch.arange(length, device=query.device)
+        delta = (positions[:, None] - positions[None, :]).clamp_min(0)
+        probability = probability * (decay**delta).view(1, 1, length, length)
+    heads = torch.einsum("bhts,bhsd->bhtd", probability, value.float())
+    mixed = heads.transpose(1, 2).reshape_as(gate) * gate.float().sigmoid()
+    return source.o_proj(mixed).float(), heads
 
 
 def _gqa_geometry_check(query, key, value, decay_logit: float) -> float:
@@ -401,7 +466,7 @@ def audit_gqa_layer(
     init_position_embeddings: tuple[torch.Tensor, torch.Tensor],
     validation_position_embeddings: tuple[torch.Tensor, torch.Tensor],
 ):
-    """Stage -1 audit against source softmax GQA using the 16x128 geometry."""
+    """Stage -1 audit with teacher-side ablations and student deltas from E0."""
     if (
         source.config.num_attention_heads != 8
         or source.config.num_key_value_heads != 2
@@ -426,16 +491,32 @@ def audit_gqa_layer(
         split: _gqa_source_components(source, hidden, position_embeddings[split])
         for split, hidden in split_inputs.items()
     }
-    teacher = {
-        split: _source_tmix_output(source, split_inputs[split], position_embeddings[split]).float()
-        for split in split_inputs
-    }
+    teacher = {}
+    teacher_heads = {}
+    for split in split_inputs:
+        output, heads = _gqa_teacher_attention(
+            source,
+            parts[split]["q_norm_rope"],
+            parts[split]["k_norm_rope"],
+            parts[split]["value"],
+            parts[split]["gate"],
+        )
+        teacher[split] = output
+        teacher_heads[split] = heads
+
     feature_q_init = _gqa_feature(parts["initialization"]["q_norm_rope"], identity_weight)
     feature_k_init = _gqa_feature(parts["initialization"]["k_norm_rope"], identity_weight)
     linear_q = _gqa_fit_linear_feature(parts["initialization"]["q_norm_rope"], feature_q_init)
     linear_k = _gqa_fit_linear_feature(parts["initialization"]["k_norm_rope"], feature_k_init)
     decay_initial = -30.0
     decay_canonical = -12.0
+    retention_canonical = math.exp(
+        -math.exp(-0.5) * torch.sigmoid(torch.tensor(decay_canonical)).item()
+    )
+    q_norm_constant = _gqa_geometric(parts["initialization"]["q_norm_scale"])
+    k_norm_constant = _gqa_geometric(parts["initialization"]["k_norm_scale"])
+    q_gamma = 1.0 + source.q_norm.weight.float()
+    k_gamma = 1.0 + source.k_norm.weight.float()
     result = {
         "layer": int(source.layer_idx),
         "source_head_size": int(source.head_dim),
@@ -452,20 +533,14 @@ def audit_gqa_layer(
                 _gqa_linear_feature(parts["initialization"]["k_norm_rope"], linear_k),
                 feature_k_init,
             ),
+            "e2_q_norm_geometric_constant": list(q_norm_constant.tolist()),
+            "e2_k_norm_geometric_constant": list(k_norm_constant.tolist()),
         },
     }
 
-    def features(split, mode):
+    def student_features(split, linear=False):
         current = parts[split]
-        if mode == "E1":
-            q_input, k_input = current["q_norm"], current["k_norm"]
-            return _gqa_feature(q_input, identity_weight), _gqa_feature(k_input, identity_weight)
-        if mode == "E2":
-            return (
-                _gqa_feature(current["q_scaled_rope"], identity_weight),
-                _gqa_feature(current["k_scaled_rope"], identity_weight),
-            )
-        if mode == "E3":
+        if linear:
             return (
                 _gqa_linear_feature(current["q_norm_rope"], linear_q),
                 _gqa_linear_feature(current["k_norm_rope"], linear_k),
@@ -475,48 +550,161 @@ def audit_gqa_layer(
             _gqa_feature(current["k_norm_rope"], identity_weight),
         )
 
-    for name in (
-        "E1_rope_removed",
-        "E2_qk_rmsnorm_removed",
-        "E3_linear_feature",
-        "E4_denominator_removed_groupnorm",
-        "E5_canonical_decay",
-    ):
-        key = name.split("_", 1)[0]
-        metrics = {}
-        for split, hidden in split_inputs.items():
-            query, key_feature = features(split, key)
-            decay = decay_canonical if key == "E5" else decay_initial
-            numerator, denominator = _gqa_recurrent(
-                query, key_feature, parts[split]["value"], decay
-            )
-            candidate = _gqa_output(
-                source,
-                numerator,
-                denominator,
-                parts[split]["gate"],
-                use_denominator=key != "E4",
-            )
-            metrics[split] = _gqa_metric(source_layer, raw_inputs[split], teacher[split], candidate)
-        component = {"metrics": metrics}
-        if key == "E5":
-            retention = math.exp(
-                -math.exp(-0.5) * torch.sigmoid(torch.tensor(decay_canonical)).item()
-            )
-            component["retention"] = retention
-            component["one_minus_decay_T"] = {
-                "512": 1 - retention**512,
-                "4096": 1 - retention**4096,
+    def add_e0_delta(metrics, baseline):
+        return {
+            split: {
+                **value,
+                "tmix_output_nmse_delta_from_E0": value["tmix_output_nmse"]
+                - baseline[split]["tmix_output_nmse"],
+                "layer_output_nmse_delta_from_E0": value["layer_output_nmse"]
+                - baseline[split]["layer_output_nmse"],
             }
-        result["components"][name] = component
+            for split, value in metrics.items()
+        }
+
+    e0_metrics = {}
+    e0_numerators = {}
+    for split in split_inputs:
+        query, key = student_features(split)
+        numerator, denominator = _gqa_recurrent(query, key, parts[split]["value"], decay_initial)
+        e0_numerators[split] = numerator
+        candidate = _gqa_output(
+            source, numerator, denominator, parts[split]["gate"], use_denominator=True
+        )
+        e0_metrics[split] = _gqa_metric(source_layer, raw_inputs[split], teacher[split], candidate)
+    result["components"]["E0_untrained_student_baseline"] = {
+        "metrics": e0_metrics,
+        "student": (
+            "identity feature, decay_logit=-30, positive denominator, no component replacement"
+        ),
+    }
+
+    e1_metrics = {}
+    e2_metrics = {}
+    for split in split_inputs:
+        current = parts[split]
+        e1_output, _ = _gqa_teacher_attention(
+            source,
+            current["q_norm"],
+            current["k_norm"],
+            current["value"],
+            current["gate"],
+        )
+        e1_metrics[split] = _gqa_metric(source_layer, raw_inputs[split], teacher[split], e1_output)
+        q_without_norm = current["query_raw"] * q_gamma.view(1, 1, 1, -1)
+        k_without_norm = current["key_raw"] * k_gamma.view(1, 1, 1, -1)
+        q_without_norm = q_without_norm / q_norm_constant.view(1, -1, 1, 1)
+        k_without_norm = k_without_norm / k_norm_constant.view(1, -1, 1, 1)
+        cos, sin = position_embeddings[split]
+        q_without_norm, k_without_norm = apply_rotary_pos_emb(
+            q_without_norm, k_without_norm, cos, sin
+        )
+        e2_output, _ = _gqa_teacher_attention(
+            source,
+            q_without_norm,
+            k_without_norm,
+            current["value"],
+            current["gate"],
+        )
+        e2_metrics[split] = _gqa_metric(source_layer, raw_inputs[split], teacher[split], e2_output)
+    result["components"]["E1_teacher_rope_removed"] = {
+        "metrics": e1_metrics,
+        "side": "source_softmax_teacher",
+    }
+    result["components"]["E2_teacher_qk_norm_geomean"] = {
+        "metrics": e2_metrics,
+        "side": "source_softmax_teacher",
+        "q_gamma_absorbed": True,
+        "k_gamma_absorbed": True,
+    }
+
+    e3_metrics = {}
+    for split in split_inputs:
+        query, key = student_features(split, linear=True)
+        numerator, denominator = _gqa_recurrent(query, key, parts[split]["value"], decay_initial)
+        candidate = _gqa_output(
+            source, numerator, denominator, parts[split]["gate"], use_denominator=True
+        )
+        e3_metrics[split] = _gqa_metric(source_layer, raw_inputs[split], teacher[split], candidate)
+    result["components"]["E3_linear_feature"] = {
+        "metrics": add_e0_delta(e3_metrics, e0_metrics),
+        "side": "untrained_student",
+    }
+
+    e4_base_metrics = {}
+    for split in split_inputs:
+        candidate = _gqa_output(
+            source,
+            e0_numerators[split],
+            torch.zeros(e0_numerators[split].shape[:3], device=e0_numerators[split].device),
+            parts[split]["gate"],
+            use_denominator=False,
+        )
+        e4_base_metrics[split] = _gqa_metric(
+            source_layer, raw_inputs[split], teacher[split], candidate
+        )
+
+    affine_weight, affine_bias, affine_fit_nmse = _gqa_fit_channel_affine(
+        _gqa_group_norm(
+            e0_numerators["initialization"],
+            source.config.num_attention_heads,
+            source.head_dim,
+        ),
+        teacher_heads["initialization"],
+    )
+    e4_ls_metrics = {}
+    for split in split_inputs:
+        candidate = _gqa_output(
+            source,
+            e0_numerators[split],
+            torch.zeros(e0_numerators[split].shape[:3], device=e0_numerators[split].device),
+            parts[split]["gate"],
+            use_denominator=False,
+            group_weight=affine_weight,
+            group_bias=affine_bias,
+        )
+        e4_ls_metrics[split] = _gqa_metric(
+            source_layer, raw_inputs[split], teacher[split], candidate
+        )
+    result["components"]["E4_denominator_removed_groupnorm"] = {
+        "metrics": add_e0_delta(e4_base_metrics, e0_metrics),
+        "side": "untrained_student",
+    }
+    result["components"]["E4_denominator_removed_groupnorm_ls_affine"] = {
+        "metrics": add_e0_delta(e4_ls_metrics, e0_metrics),
+        "side": "untrained_student",
+        "affine_fit_target": "source_softmax_attention_heads_before_gate_and_o_proj",
+        "affine_fit_nmse": affine_fit_nmse,
+    }
+
+    e5_metrics = {}
+    for split in split_inputs:
+        current = parts[split]
+        e5_output, _ = _gqa_teacher_attention(
+            source,
+            current["q_norm_rope"],
+            current["k_norm_rope"],
+            current["value"],
+            current["gate"],
+            decay=retention_canonical,
+        )
+        e5_metrics[split] = _gqa_metric(source_layer, raw_inputs[split], teacher[split], e5_output)
+    result["components"]["E5_teacher_canonical_decay"] = {
+        "metrics": e5_metrics,
+        "side": "source_softmax_teacher",
+        "decay": retention_canonical,
+        "decay_application": "softmax_probability_times_d_delta_t_without_renormalization",
+        "one_minus_decay_T": {
+            "512": 1 - retention_canonical**512,
+            "4096": 1 - retention_canonical**4096,
+        },
+    }
 
     geometry = {}
     for split in split_inputs:
-        query, key_feature = features(split, "base")
+        query, key = student_features(split)
         geometry[split] = {
-            "geometry_nmse": _gqa_geometry_check(
-                query, key_feature, parts[split]["value"], decay_initial
-            )
+            "geometry_nmse": _gqa_geometry_check(query, key, parts[split]["value"], decay_initial)
         }
     result["components"]["E6_value_half_geometry_self_check"] = {
         "metrics": geometry,
