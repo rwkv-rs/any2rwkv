@@ -503,10 +503,22 @@ def audit_gdn_layer(
     source_key_norm = torch.sqrt(source_key.square().sum(-1) + 1e-6)
     ka_grid = (0.0, 0.25, 0.5, 0.75, 1.0)
     gamma_bars = {}
+    gamma_log_variances = {}
     for ka in ka_grid:
         factor = 1 + (source_a - 1) * ka
         gamma = source_parts["initialization"]["beta"] / (source_key_norm * factor)
         gamma_bars[ka] = _gdn_geometric(gamma)
+        gamma_log_variances[ka] = gamma.log().var(dim=(0, 1), unbiased=False)
+    variance_grid = torch.stack([gamma_log_variances[ka] for ka in ka_grid])
+    best_ka_heads = torch.tensor(
+        [ka_grid[index] for index in variance_grid.argmin(0).tolist()],
+        device=init_hidden.device,
+        dtype=torch.float32,
+    )
+    selected_factor = 1 + (source_a - 1) * best_ka_heads.view(1, 1, -1)
+    selected_gamma_bar = _gdn_geometric(
+        source_parts["initialization"]["beta"] / (source_key_norm * selected_factor)
+    )
 
     # The canonical all-at-once candidate recomputes q/k gain statistics after
     # the closed-form frontend replacement, rather than mixing two coordinate gauges.
@@ -717,14 +729,34 @@ def audit_gdn_layer(
                     parts["log_decay"],
                 ),
             )[0]
+    selected_metrics = {}
+    for split in split_inputs:
+        selected_metrics[split] = evaluate_front(
+            split,
+            source_front[split],
+            separate=lambda parts: (
+                parts["query_norm"] / math.sqrt(source.head_k_dim),
+                parts["key_norm"],
+                parts["beta"] * parts["log_decay"].exp(),
+                parts["key_raw"]
+                * (
+                    1
+                    + (parts["beta"] * parts["log_decay"].exp() - 1) * best_ka_heads.view(1, 1, -1)
+                )[..., None],
+                parts["value"] * selected_gamma_bar.view(1, 1, -1, 1),
+                parts["log_decay"],
+            ),
+        )[0]
     best_ka = min(
         ka_grid, key=lambda ka: grid_metrics[str(ka)]["initialization"]["tmix_output_nmse"]
     )
     put(
         "D7_write_gain_best_ka_grid",
-        grid_metrics[str(best_ka)],
-        k_a=best_ka,
-        gamma_geometric_mean=list(gamma_bars[best_ka].tolist()),
+        selected_metrics,
+        k_a=list(best_ka_heads.tolist()),
+        gamma_geometric_mean=list(selected_gamma_bar.tolist()),
+        selection="per_head_min_variance_log_gamma",
+        best_scalar_output_k_a=best_ka,
         grid=grid_metrics,
     )
 
@@ -827,11 +859,11 @@ def audit_gdn_layer(
     # D12: all closed-form canonical substitutions at once.  This is deliberately
     # a zero-training student: the only fitted quantities are the §3.2 closed
     # regressions used as initialization, and no validation tensor enters them.
-    canonical_ka = best_ka
+    canonical_ka = best_ka_heads
     canonical_a_init = _gdn_apply_erase(source, normalized["initialization"], erase_fit)
     canonical_gamma = _gdn_geometric(
         source_parts["initialization"]["beta"]
-        / (canonical_key_norm * (1 + (canonical_a_init - 1) * canonical_ka))
+        / (canonical_key_norm * (1 + (canonical_a_init - 1) * canonical_ka.view(1, 1, -1)))
     )
     d12_metrics = {}
     for split in split_inputs:
@@ -848,7 +880,7 @@ def audit_gdn_layer(
         parts = _gdn_components(source, hidden, frontend)
         fitted_erase = _gdn_apply_erase(source, hidden, erase_fit)
         fitted_log_decay, _ = _gdn_apply_decay(source, hidden, decay_fit)
-        factor = 1 + (fitted_erase - 1) * canonical_ka
+        factor = 1 + (fitted_erase - 1) * canonical_ka.view(1, 1, -1)
         raw = _rwkv_trace_separate(
             parts["query_raw"] * canonical_rho.view(1, 1, -1, 1),
             parts["key_norm"],
@@ -865,7 +897,7 @@ def audit_gdn_layer(
     put(
         "D12_all_D1_D11_canonical_zero_training",
         d12_metrics,
-        selected_k_a=canonical_ka,
+        selected_k_a=list(canonical_ka.tolist()),
         canonical_decay_floor=W_SCALE,
     )
     return result
