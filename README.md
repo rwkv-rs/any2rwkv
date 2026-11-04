@@ -12,6 +12,12 @@ The first layer's values are carried through both layerwise caches and model for
 Qwen embeddings, decoder RMSNorm, MLP, residual
 structure, tokenizer, and tied LM head remain unchanged.
 
+An opt-in [GQA priming path](docs/gqa_priming.md) transfers the full signed Q/K/V
+representations into one RWKV7 DPLR state per query head, with adaptive K/V head
+expansion (AGQA). It provides a separate GQA-only layerwise alignment entry and
+checkpoint schema. The existing positive-feature conversion and scaffold commands
+remain the default; their acceptance checks do not apply to the priming variant.
+
 During layerwise distillation the frozen source GQA block is a teacher only. An
 external gate mixes teacher and pure RWKV outputs through the fixed schedule
 `0.9 → 0.75 → 0.5 → 0.25 → 0.1 → 0.0`; the loss always includes a four-times
