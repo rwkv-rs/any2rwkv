@@ -60,3 +60,7 @@ ssh rwkv-sha-pro6000x8
 cd ~/Projects/MachineLearning/transformers-rwkv
 ```
 use git to sync your changes instead of rsync.
+
+## Pull request review
+
+Before reviewing or re-reviewing a pull request, read the [pull request review guide](.github/PR_REVIEW.md) and follow its rules.
