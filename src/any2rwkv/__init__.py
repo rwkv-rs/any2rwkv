@@ -1,9 +1,14 @@
 """Mathematical initialization and greedy alignment into RWKV-7."""
 
-from .qwen2rwkv.qwen3_5.transformers.modeling_qwen2rwkv import (
-    Qwen2RWKVConfig,
-    Qwen2RWKVForCausalLM,
-)
+
+def __getattr__(name):
+    if name in {"Qwen2RWKVConfig", "Qwen2RWKVForCausalLM"}:
+        from .qwen2rwkv.qwen3_5.transformers import modeling_qwen2rwkv
+
+        value = getattr(modeling_qwen2rwkv, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def convert_qwen3_5_2b(*args, **kwargs):
